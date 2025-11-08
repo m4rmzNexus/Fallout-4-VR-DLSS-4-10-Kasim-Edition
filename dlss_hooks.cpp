@@ -51,7 +51,7 @@ namespace {
     bool g_imguiMenuInitialized = false;
     bool g_overlaySafeMode = false;
 
-    LARGE_INTEGER g_perfFrequency = {
+    LARGE_INTEGER g_perfFrequency = {};
     // Helper to fetch texture desc from RTV (if possible)
     static bool GetDescFromRTV(ID3D11RenderTargetView* rtv, D3D11_TEXTURE2D_DESC* outDesc) {
         if (!rtv || !outDesc) return false;
@@ -66,7 +66,7 @@ namespace {
         tex->Release();
         return true;
     }
-};
+    
     LARGE_INTEGER g_lastFrameTime = {};
 
     bool g_initializedGlobals = false;
@@ -93,7 +93,8 @@ namespace {
     // Phase 1 (viewport clamp) state
     std::atomic<bool> g_sceneActive{false};
     D3D11_TEXTURE2D_DESC g_sceneRTDesc{};
-    int g_clampLogBudgetPerFrame = 4;`n    bool g_compositedThisFrame = false;
+    int g_clampLogBudgetPerFrame = 4;
+    bool g_compositedThisFrame = false;
     // Phase 2 (RT redirect) state and cache
     std::atomic<bool> g_redirectUsedThisFrame{false};
     struct RedirectEntry {
@@ -276,7 +277,9 @@ HRESULT WINAPI HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT
         // Reset Phase 1 scene/clamp state per frame
         g_sceneActive.store(false, std::memory_order_relaxed);
         g_sceneRTDesc = {};
-        g_clampLogBudgetPerFrame = 4;`n        g_compositedThisFrame = false;`n        g_redirectUsedThisFrame.store(false, std::memory_order_relaxed);
+        g_clampLogBudgetPerFrame = 4;
+        g_compositedThisFrame = false;
+        g_redirectUsedThisFrame.store(false, std::memory_order_relaxed);
         if (g_pendingResizeHook && pSwapChain && !g_resizeHookInstalled) {
             if (InstallResizeHook(pSwapChain)) {
                 _MESSAGE("Deferred IDXGISwapChain::ResizeBuffers hook installed");
