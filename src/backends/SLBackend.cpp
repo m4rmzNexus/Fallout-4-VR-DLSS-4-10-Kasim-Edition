@@ -515,6 +515,11 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
         
         return inputColor;
     }
+    // Mark viewport as allocated and cache sizes after a successful evaluate
+    if (needRealloc) {
+        vpAllocated = true;
+        vpInW = renderWidth; vpInH = renderHeight; vpOutW = outputWidth; vpOutH = outputHeight;
+    }
     
     // Reset error count on success
     static int successCount = 0;
