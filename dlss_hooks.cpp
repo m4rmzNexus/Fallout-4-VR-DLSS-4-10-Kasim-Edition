@@ -522,25 +522,44 @@ namespace {
         ID3D11Texture2D* processedTexture = nullptr;
         const bool dlssReady = EnsureDLSSRuntimeReady();
 
-        // Track per-eye display size from bounds
-        if (colorTexture) {
-            D3D11_TEXTURE2D_DESC eyeDesc{}; colorTexture->GetDesc(&eyeDesc);
-            uint32_t fullW = eyeDesc.Width;
-            uint32_t fullH = eyeDesc.Height;
-            double uSpan = 1.0, vSpan = 1.0;
-            if (bounds) {
-                uSpan = std::max(0.0, std::min(1.0, (double)bounds->uMax - (double)bounds->uMin));
-                vSpan = std::max(0.0, std::min(1.0, (double)bounds->vMax - (double)bounds->vMin));
+        // Track per-eye display size using OpenVR recommended target size (more stable than texture size)
+        {
+            uint32_t recW = 0, recH = 0;
+            // Try to get IVRSystem via VR_GetGenericInterface without a direct import
+            if (HMODULE openVRModule = GetModuleHandleW(L"openvr_api.dll")) {
+                using PFN_VR_GetGenericInterface = void* (VR_CALLTYPE*)(const char*, vr::EVRInitError*);
+                if (auto getIface = reinterpret_cast<PFN_VR_GetGenericInterface>(GetProcAddress(openVRModule, "VR_GetGenericInterface"))) {
+                    vr::EVRInitError err = vr::VRInitError_None;
+                    void* ptr = getIface(vr::IVRSystem_Version, &err);
+                    if (ptr && err == vr::VRInitError_None) {
+                        auto sys = reinterpret_cast<vr::IVRSystem*>(ptr);
+                        uint32_t w=0,h=0; sys->GetRecommendedRenderTargetSize(&w, &h);
+                        recW = w; recH = h;
+                    }
+                }
             }
-            uint32_t outW = (uint32_t)std::max(1.0, uSpan * (double)fullW);
-            uint32_t outH = (uint32_t)std::max(1.0, vSpan * (double)fullH);
+            // Fallback: derive from submitted texture bounds if VRSystem not available yet
+            if (recW == 0 || recH == 0) {
+                if (colorTexture) {
+                    D3D11_TEXTURE2D_DESC eyeDesc{}; colorTexture->GetDesc(&eyeDesc);
+                    uint32_t fullW = eyeDesc.Width;
+                    uint32_t fullH = eyeDesc.Height;
+                    double uSpan = 1.0, vSpan = 1.0;
+                    if (bounds) {
+                        uSpan = std::max(0.0, std::min(1.0, (double)bounds->uMax - (double)bounds->uMin));
+                        vSpan = std::max(0.0, std::min(1.0, (double)bounds->vMax - (double)bounds->vMin));
+                    }
+                    recW = (uint32_t)std::max(1.0, uSpan * (double)fullW);
+                    recH = (uint32_t)std::max(1.0, vSpan * (double)fullH);
+                }
+            }
             // even-align and clamp
-            outW &= ~1u; outH &= ~1u;
-            if (outW > 8192u) outW = 8192u; if (outH > 8192u) outH = 8192u;
+            recW &= ~1u; recH &= ~1u;
+            if (recW > 8192u) recW = 8192u; if (recH > 8192u) recH = 8192u;
             const int idx = (eye == vr::Eye_Left) ? 0 : 1;
-            if (outW > 0 && outH > 0) {
-                g_perEyeOutW[idx].store(outW, std::memory_order_relaxed);
-                g_perEyeOutH[idx].store(outH, std::memory_order_relaxed);
+            if (recW > 0 && recH > 0) {
+                g_perEyeOutW[idx].store(recW, std::memory_order_relaxed);
+                g_perEyeOutH[idx].store(recH, std::memory_order_relaxed);
             }
         }
 

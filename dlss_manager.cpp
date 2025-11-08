@@ -976,9 +976,18 @@ ID3D11Texture2D* DLSSManager::ProcessEye(EyeContext& eye,
         _MESSAGE("[SL] ProcessEye: rw=%u rh=%u ow=%u oh=%u depth=%d mv=%d reset=%d",
                  renderWidth, renderHeight, perEyeOutW, perEyeOutH,
                  depthTexture?1:0, motionVectors?1:0, (eye.requiresReset||forceReset)?1:0);
-        // Downscale input color to render size if needed
-        if (!DownscaleToRender(eye, inputTexture, renderWidth, renderHeight)) {
-            return inputTexture;
+        // If input already matches render size, skip downscale pass and use it directly
+        bool useInputDirect = false;
+        if (inputDesc.Width == renderWidth && inputDesc.Height == renderHeight) {
+            useInputDirect = true;
+            eye.renderWidth = renderWidth;
+            eye.renderHeight = renderHeight;
+            eye.requiresReset = true; // first time with direct-path
+        } else {
+            // Downscale input color to render size
+            if (!DownscaleToRender(eye, inputTexture, renderWidth, renderHeight)) {
+                return inputTexture;
+            }
         }
 
         // Ensure output texture for the desired per-eye output dimensions
@@ -1019,7 +1028,8 @@ ID3D11Texture2D* DLSSManager::ProcessEye(EyeContext& eye,
             }
         }
 
-        ID3D11Texture2D* out = m_backend->ProcessEye(eye.renderColor, depthForDlss, mv, eye.outputTexture,
+        ID3D11Texture2D* colorForBackend = useInputDirect ? inputTexture : eye.renderColor;
+        ID3D11Texture2D* out = m_backend->ProcessEye(colorForBackend, depthForDlss, mv, eye.outputTexture,
                                                      renderWidth, renderHeight,
                                                      perEyeOutW, perEyeOutH,
                                                      (eye.requiresReset || forceReset));
