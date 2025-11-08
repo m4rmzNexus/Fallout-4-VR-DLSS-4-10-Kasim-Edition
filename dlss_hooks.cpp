@@ -561,6 +561,24 @@ namespace {
                 g_perEyeOutW[idx].store(recW, std::memory_order_relaxed);
                 g_perEyeOutH[idx].store(recH, std::memory_order_relaxed);
             }
+
+            // Phase 0 instrumentation: optional debug probe of predicted render size
+            // based on current DLSS quality and per-eye output, without changing behavior.
+            static uint64_t s_dbgCounter = 0;
+            ++s_dbgCounter;
+            if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
+                // Log at a low rate to avoid spam
+                if ((s_dbgCounter % 300) == 1) {
+                    uint32_t prW = 0, prH = 0;
+                    if (g_dlssManager && g_dlssManager->ComputeRenderSizeForOutput(recW, recH, prW, prH)) {
+                        _MESSAGE("[EarlyDLSS][DBG] eye=%s out=%ux%u -> predicted render=%ux%u (mode=%d)",
+                                 (eye==vr::Eye_Left?"L":"R"), recW, recH, prW, prH, (int)g_dlssConfig->earlyDlssMode);
+                    } else {
+                        _MESSAGE("[EarlyDLSS][DBG] eye=%s out=%ux%u -> predicted render=(n/a)",
+                                 (eye==vr::Eye_Left?"L":"R"), recW, recH);
+                    }
+                }
+            }
         }
 
         if (colorTexture && dlssReady) {

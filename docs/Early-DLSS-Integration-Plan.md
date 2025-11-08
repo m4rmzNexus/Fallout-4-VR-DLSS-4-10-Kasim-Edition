@@ -148,3 +148,13 @@ Amaç: DLSS moduna göre MIP LOD bias’ı otomatik set etmek; jitter/matris/mve
 - VR özel optimizasyonlar (periphery/foveated) ile ek kazanç.
 
 Not: İlk kazanım için Faz 1 (viewport clamp) güvenlidir; daha büyük kazanım için Faz 2 (RT redirect) önerilir. Tüm adımlar feature flag’lerle güvence altına alınır ve geri alınabilir.
+---
+
+## Uygulama Kontrol Listesi (Güncel Durum)
+
+- [x] INI/Config: EarlyDlssEnabled, EarlyDlssMode, DebugEarlyDlss okuma/yazma.
+- [x] UI: ImGui menüsünde "Early DLSS (Experimental)" bölümü (toggle, mod, debug).
+- [x] Log: OpenVR RecommendedRenderTargetSize per-eye alınıp düşük frekansta debug satırları (davranış değişimi yok).
+- [x] Yardımcı: DLSSManager::ComputeRenderSizeForOutput(out→render) eklendi.
+- [ ] Faz 1: RSSetViewports/OMSetRenderTargets hook'ları (viewport clamp) ve DebugEarlyDlss logları.
+- [ ] Faz 2: CreateTexture2D/OMSetRenderTargets ile RT redirect (guarded by EarlyDlssMode==rt_redirect).

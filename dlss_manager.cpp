@@ -468,6 +468,7 @@ void DLSSManager::SetQuality(Quality quality) {
 #endif
     m_leftEye.requiresReset = true;
     m_rightEye.requiresReset = true;
+    _MESSAGE("[CFG] Quality set to %d", static_cast<int>(quality));
 }
 
 void DLSSManager::SetSharpeningEnabled(bool enabled) {
@@ -536,6 +537,51 @@ void DLSSManager::SetFoveatedCutout(float cutoutRadius) {
 
 void DLSSManager::SetFoveatedWiden(float widen) {
     m_foveatedWiden = widen;
+}
+
+bool DLSSManager::ComputeRenderSizeForOutput(uint32_t outW, uint32_t outH, uint32_t& renderW, uint32_t& renderH) {
+    renderW = 0;
+    renderH = 0;
+    if (outW == 0 || outH == 0) {
+        return false;
+    }
+#if USE_STREAMLINE
+    // Prefer Streamline's DLSS optimal settings when backend is ready
+    if (m_backend && m_backend->IsReady()) {
+        auto MapToSLMode = [&](Quality q)->sl::DLSSMode {
+            switch (q) {
+                case Quality::Performance:       return sl::DLSSMode::eMaxPerformance;
+                case Quality::Balanced:         return sl::DLSSMode::eBalanced;
+                case Quality::Quality:          return sl::DLSSMode::eMaxQuality;
+                case Quality::UltraPerformance: return sl::DLSSMode::eUltraPerformance;
+                case Quality::UltraQuality:     return sl::DLSSMode::eUltraQuality;
+                case Quality::DLAA:             return sl::DLSSMode::eDLAA;
+                default:                        return sl::DLSSMode::eMaxQuality;
+            }
+        };
+        sl::DLSSOptions opts{};
+        opts.mode = MapToSLMode(m_quality);
+        opts.outputWidth = outW;
+        opts.outputHeight = outH;
+        sl::DLSSOptimalSettings os{};
+        if (sl::Result::eOk == slDLSSGetOptimalSettings(opts, os)) {
+            renderW = os.optimalRenderWidth;
+            renderH = os.optimalRenderHeight;
+        }
+    }
+#endif
+    if (renderW == 0 || renderH == 0) {
+        // Fallback: uniform scale from the static quality table
+        const float s = GetQualityInfo(m_quality).scale;
+        renderW = static_cast<uint32_t>(static_cast<float>(outW) * s);
+        renderH = static_cast<uint32_t>(static_cast<float>(outH) * s);
+    }
+    // Even align and clamp to not exceed output
+    renderW &= ~1u; renderH &= ~1u;
+    if (renderW == 0) renderW = 2; if (renderH == 0) renderH = 2;
+    if (renderW > outW)  renderW = outW;
+    if (renderH > outH)  renderH = outH;
+    return true;
 }
 
 namespace {
@@ -945,10 +991,12 @@ ID3D11Texture2D* DLSSManager::ProcessEye(EyeContext& eye,
     slOpts.mode = MapToSLMode(m_quality);
     slOpts.outputWidth = perEyeOutW;
     slOpts.outputHeight = perEyeOutH;
+    _MESSAGE("[SL] OptimalSettings query: mode=%u out=%ux%u", (unsigned)slOpts.mode, perEyeOutW, perEyeOutH);
     sl::DLSSOptimalSettings slSet{};
     if (sl::Result::eOk == slDLSSGetOptimalSettings(slOpts, slSet)) {
         renderWidth = slSet.optimalRenderWidth;
         renderHeight = slSet.optimalRenderHeight;
+        _MESSAGE("[SL] OptimalSettings result: render=%ux%u", renderWidth, renderHeight);
     }
 #endif
     if (renderWidth == 0 || renderHeight == 0) {

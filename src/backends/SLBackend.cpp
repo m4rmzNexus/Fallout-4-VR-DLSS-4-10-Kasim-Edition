@@ -215,6 +215,7 @@ void SLBackend::SetQuality(int qualityEnum) {
         case 5: m_options.mode = sl::DLSSMode::eDLAA; break;
         default: m_options.mode = sl::DLSSMode::eMaxQuality; break;
     }
+    _MESSAGE("[SL] Backend quality set: %d -> DLSSMode=%u", qualityEnum, (unsigned)m_options.mode);
 #endif
 }
 

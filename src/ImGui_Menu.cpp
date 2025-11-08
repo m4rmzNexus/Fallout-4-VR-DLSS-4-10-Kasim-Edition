@@ -61,6 +61,11 @@ private:
     float foveatedCutoutRadius = 1.2f;
     float foveatedWiden = 1.5f;
 
+    // Early DLSS (experimental) UI state
+    bool earlyDlssEnabledSetting = false;
+    int  earlyDlssModeSetting = 0; // 0=viewport clamp, 1=rt_redirect
+    bool debugEarlyDlssSetting = false;
+
     HotkeyBinding menuHotkey{VK_END, false};
     HotkeyBinding toggleHotkey{VK_MULTIPLY, false};
     HotkeyBinding cycleQualityHotkey{VK_HOME, false};
@@ -124,6 +129,11 @@ public:
         foveatedOffsetY = g_dlssConfig->foveatedOffsetY;
         foveatedCutoutRadius = g_dlssConfig->foveatedCutoutRadius;
         foveatedWiden = g_dlssConfig->foveatedWiden;
+
+        // Early DLSS flags
+        earlyDlssEnabledSetting = g_dlssConfig->earlyDlssEnabled;
+        earlyDlssModeSetting = g_dlssConfig->earlyDlssMode;
+        debugEarlyDlssSetting = g_dlssConfig->debugEarlyDlss;
 
         hotkeysDirty = true;
     }
@@ -222,6 +232,23 @@ public:
                     ApplyAdvancedSettings();
                 }
                 ImGui::EndDisabled();
+            }
+
+            if (ImGui::CollapsingHeader("Early DLSS (Experimental)", 0)) {
+                ImGui::TextWrapped("Render-time DLSS integration to reduce shading resolution.\n"
+                                   "Faz 1 (Viewport clamp) and Faz 2 (RT redirect) are guarded by flags.");
+                if (ImGui::Checkbox("Enable Early DLSS", &earlyDlssEnabledSetting)) {
+                    WriteSettingsToConfig(false);
+                }
+                const char* earlyModes[] = { "Viewport clamp", "RT redirect" };
+                if (ImGui::Combo("Mode", &earlyDlssModeSetting, earlyModes, IM_ARRAYSIZE(earlyModes))) {
+                    WriteSettingsToConfig(false);
+                }
+                if (ImGui::Checkbox("Debug logs (low rate)", &debugEarlyDlssSetting)) {
+                    WriteSettingsToConfig(false);
+                }
+                ImGui::Separator();
+                ImGui::TextDisabled("Note: Phase 0 instrumentation only (no behavior change).");
             }
 
             if (ImGui::CollapsingHeader("Advanced Rendering", showAdvancedSettings ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
@@ -507,6 +534,11 @@ private:
         g_dlssConfig->foveatedOffsetY = foveatedOffsetY;
         g_dlssConfig->foveatedCutoutRadius = foveatedCutoutRadius;
         g_dlssConfig->foveatedWiden = foveatedWiden;
+
+        // Early DLSS flags
+        g_dlssConfig->earlyDlssEnabled = earlyDlssEnabledSetting;
+        g_dlssConfig->earlyDlssMode = earlyDlssModeSetting;
+        g_dlssConfig->debugEarlyDlss = debugEarlyDlssSetting;
 
         if (persist) {
             g_dlssConfig->Save();

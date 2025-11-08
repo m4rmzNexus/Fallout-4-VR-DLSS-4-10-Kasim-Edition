@@ -271,6 +271,17 @@ void DLSSConfig::ParseIniFile(const std::string& path) {
                 mipLodBias = ParseFloat(value);
             } else if (normalizedKey == "renderreshadebeforeupscaling") {
                 renderReShadeBeforeUpscaling = StringToBool(value);
+            } else if (normalizedKey == "earlydlssenabled") {
+                earlyDlssEnabled = StringToBool(value);
+            } else if (normalizedKey == "earlydlssmode") {
+                std::string v = ToLower(value);
+                if (v == "viewport") earlyDlssMode = 0; else if (v == "rt_redirect" || v == "rtredirect") earlyDlssMode = 1; else earlyDlssMode = ClampValue(ParseInt(value), 0, 1);
+            } else if (normalizedKey == "peripherytaaenabled") {
+                peripheryTAAEnabled = StringToBool(value);
+            } else if (normalizedKey == "foveatedrenderingenabled") {
+                foveatedRenderingEnabled = StringToBool(value);
+            } else if (normalizedKey == "debugearlydlss") {
+                debugEarlyDlss = StringToBool(value);
             } else if (normalizedKey == "upscaledepthforreshade" || normalizedKey == "upscaledeptforreshade") {
                 upscaleDepthForReShade = StringToBool(value);
             } else if (normalizedKey == "usetaaforperiphery") {
@@ -381,6 +392,12 @@ void DLSSConfig::Save() {
     file << "RenderReShadeBeforeUpscaling = " << boolToString(renderReShadeBeforeUpscaling) << std::endl;
     file << "UpscaleDepthForReShade = " << boolToString(upscaleDepthForReShade) << std::endl;
     file << "UseTAAForPeriphery = " << boolToString(useTAAForPeriphery) << std::endl;
+    // Early DLSS integration flags
+    file << "EarlyDlssEnabled = " << boolToString(earlyDlssEnabled) << std::endl;
+    file << "EarlyDlssMode = " << earlyDlssMode << std::endl;
+    file << "PeripheryTAAEnabled = " << boolToString(peripheryTAAEnabled) << std::endl;
+    file << "FoveatedRenderingEnabled = " << boolToString(foveatedRenderingEnabled) << std::endl;
+    file << "DebugEarlyDlss = " << boolToString(debugEarlyDlss) << std::endl;
     file << "DLSSPreset = " << dlssPreset << std::endl;
     file << "FOV = " << fov << std::endl << std::endl;
     file << "; UI scale for ImGui menu (0.5 - 3.0). 1.5 is good for VR" << std::endl;

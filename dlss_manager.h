@@ -71,6 +71,11 @@ public:
     void SetFoveatedCutout(float cutoutRadius);
     void SetFoveatedWiden(float widen);
 
+    // Compute the DLSS render size for a given per-eye output size according to
+    // current quality/mode. Uses Streamline OptimalSettings when available; falls
+    // back to the static quality scale table otherwise. Returns true on success.
+    bool ComputeRenderSizeForOutput(uint32_t outW, uint32_t outH, uint32_t& renderW, uint32_t& renderH);
+
 private:
     // Per-eye DLSS contexts for VR
     struct EyeContext {

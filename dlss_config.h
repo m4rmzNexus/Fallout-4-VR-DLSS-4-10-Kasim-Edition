@@ -72,6 +72,13 @@ public:
     int cycleQualityKey = 0x24;    // VK_HOME
     int cycleUpscalerKey = 0x2D;   // VK_INSERT
 
+    // Early DLSS integration (render-time) flags
+    bool earlyDlssEnabled = false;       // Faz 1/2 entegrasyonu aç/kapa
+    int  earlyDlssMode = 0;              // 0=viewport clamp, 1=rt_redirect
+    bool peripheryTAAEnabled = true;     // DLSS dikdörtgeni dışını TAA ile çöz
+    bool foveatedRenderingEnabled = false; // FFR/FFU ana bayrak
+    bool debugEarlyDlss = false;         // Geniş log
+
 private:
     void ParseIniFile(const std::string& path);
 };
