@@ -34,6 +34,14 @@ namespace DLSSHooks {
     extern PFN_FactoryCreateSwapChain RealFactoryCreateSwapChain;
     HRESULT STDMETHODCALLTYPE HookedFactoryCreateSwapChain(IDXGIFactory* factory, IUnknown* pDevice, DXGI_SWAP_CHAIN_DESC* pDesc, IDXGISwapChain** ppSwapChain);
 
+    // Context hooks for early DLSS (Phase 1, viewport clamp)
+    typedef void (STDMETHODCALLTYPE* PFN_RSSetViewports)(ID3D11DeviceContext* ctx, UINT count, const D3D11_VIEWPORT* viewports);
+    typedef void (STDMETHODCALLTYPE* PFN_OMSetRenderTargets)(ID3D11DeviceContext* ctx, UINT numRTVs, ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV);
+    extern PFN_RSSetViewports RealRSSetViewports;
+    extern PFN_OMSetRenderTargets RealOMSetRenderTargets;
+    void STDMETHODCALLTYPE HookedRSSetViewports(ID3D11DeviceContext* ctx, UINT count, const D3D11_VIEWPORT* viewports);
+    void STDMETHODCALLTYPE HookedOMSetRenderTargets(ID3D11DeviceContext* ctx, UINT numRTVs, ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV);
+
     void RegisterMotionVectorTexture(ID3D11Texture2D* motionTexture);
     void RegisterFallbackDepthTexture(ID3D11Texture2D* depthTexture,
                                       const D3D11_TEXTURE2D_DESC* desc = nullptr,

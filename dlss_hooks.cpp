@@ -17,6 +17,7 @@
 #include <chrono>
 #include <limits>
 #include <cmath>
+#include <vector>
 
 extern DLSSManager* g_dlssManager;
 extern DLSSConfig* g_dlssConfig;
@@ -48,7 +49,22 @@ namespace {
     bool g_imguiMenuInitialized = false;
     bool g_overlaySafeMode = false;
 
-    LARGE_INTEGER g_perfFrequency = {};
+    LARGE_INTEGER g_perfFrequency = {
+    // Helper to fetch texture desc from RTV (if possible)
+    static bool GetDescFromRTV(ID3D11RenderTargetView* rtv, D3D11_TEXTURE2D_DESC* outDesc) {
+        if (!rtv || !outDesc) return false;
+        ID3D11Resource* res = nullptr;
+        rtv->GetResource(&res);
+        if (!res) return false;
+        ID3D11Texture2D* tex = nullptr;
+        HRESULT hr = res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex);
+        res->Release();
+        if (FAILED(hr) || !tex) return false;
+        tex->GetDesc(outDesc);
+        tex->Release();
+        return true;
+    }
+};
     LARGE_INTEGER g_lastFrameTime = {};
 
     bool g_initializedGlobals = false;
@@ -72,6 +88,10 @@ namespace {
     std::atomic<DlssState> g_state{DlssState::Cold};
     static ID3D11Texture2D* g_upscaledEyeTex[2] = { nullptr, nullptr };
     std::atomic<bool> g_lastEvaluateOk{false};
+    // Phase 1 (viewport clamp) state
+    std::atomic<bool> g_sceneActive{false};
+    D3D11_TEXTURE2D_DESC g_sceneRTDesc{};
+    int g_clampLogBudgetPerFrame = 4;
 
 
     void SafeAssignTexture(ID3D11Texture2D*& target, ID3D11Texture2D* source) {
@@ -145,6 +165,8 @@ namespace DLSSHooks {
     PFN_ResizeBuffers RealResizeBuffers = nullptr;
     PFN_CreateTexture2D RealCreateTexture2D = nullptr;
     PFN_FactoryCreateSwapChain RealFactoryCreateSwapChain = nullptr;
+    PFN_RSSetViewports RealRSSetViewports = nullptr;
+    PFN_OMSetRenderTargets RealOMSetRenderTargets = nullptr;
 
     static void InitializeImGuiBackend(IDXGISwapChain* swapChain) {
         if (g_imguiBackendInitialized || !swapChain || !g_device || !g_context) {
@@ -236,9 +258,13 @@ namespace DLSSHooks {
         g_lastFrameTime.QuadPart = 0;
     }
 
-    HRESULT WINAPI HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags) {
+HRESULT WINAPI HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags) {
         EnsureGlobalInstances();
         EnsureVRSubmitHookInstalled();
+        // Reset Phase 1 scene/clamp state per frame
+        g_sceneActive.store(false, std::memory_order_relaxed);
+        g_sceneRTDesc = {};
+        g_clampLogBudgetPerFrame = 4;
         if (g_pendingResizeHook && pSwapChain && !g_resizeHookInstalled) {
             if (InstallResizeHook(pSwapChain)) {
                 _MESSAGE("Deferred IDXGISwapChain::ResizeBuffers hook installed");
@@ -702,7 +728,17 @@ namespace {
     void TryHookDevice(ID3D11Device* device) {
         if (!device) {
             return;
+            
+        // Hook the immediate context for viewport clamp
+        ID3D11DeviceContext* ctx = nullptr;
+        device->GetImmediateContext(&ctx);
+        if (ctx) {
+            // ID3D11DeviceContext vtable indices (common): OMSetRenderTargets ~33, RSSetViewports ~44
+            HookVTableFunction(ctx, 33, DLSSHooks::HookedOMSetRenderTargets, &DLSSHooks::RealOMSetRenderTargets) | Out-Null;
+            HookVTableFunction(ctx, 44, DLSSHooks::HookedRSSetViewports, &DLSSHooks::RealRSSetViewports) | Out-Null;
+            ctx->Release();
         }
+    }
 
         if (g_hookedDevice == device && g_deviceHookInstalled) {
             return;
@@ -1149,3 +1185,96 @@ extern "C" void SetOverlaySafeMode(bool enabled) {
 
 
 
+
+
+namespace DLSSHooks {
+    // Heuristic: decide if an RTV looks like a scene color target
+    static bool IsSceneColorRTDesc(const D3D11_TEXTURE2D_DESC& d) {
+        if (d.SampleDesc.Count != 1) return false;
+        if ((d.BindFlags & D3D11_BIND_RENDER_TARGET) == 0) return false;
+        if (d.Width < 1024 || d.Height < 1024) return false;
+        return true;
+    }
+
+    void STDMETHODCALLTYPE HookedOMSetRenderTargets(ID3D11DeviceContext* ctx, UINT numRTVs, ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV) {
+        if (RealOMSetRenderTargets) {
+            RealOMSetRenderTargets(ctx, numRTVs, ppRTVs, pDSV);
+        }
+        if (!g_dlssConfig || !g_dlssConfig->earlyDlssEnabled) {
+            return;
+        }
+        if (!ppRTVs || numRTVs == 0 || !ppRTVs[0]) {
+            return;
+        }
+        D3D11_TEXTURE2D_DESC d{};
+        if (GetDescFromRTV(ppRTVs[0], &d)) {
+            if (IsSceneColorRTDesc(d)) {
+                g_sceneRTDesc = d;
+                g_sceneActive.store(true, std::memory_order_relaxed);
+                if (g_dlssConfig->debugEarlyDlss) {
+                    _MESSAGE("[EarlyDLSS][SceneBegin] RTV=%ux%u fmt=%u", d.Width, d.Height, (unsigned)d.Format);
+                }
+            }
+        }
+    }
+
+    void STDMETHODCALLTYPE HookedRSSetViewports(ID3D11DeviceContext* ctx, UINT count, const D3D11_VIEWPORT* viewports) {
+        // Default: pass through
+        if (!g_dlssConfig || !g_dlssConfig->earlyDlssEnabled || g_dlssConfig->earlyDlssMode != 0 || !viewports || count == 0) {
+            if (RealRSSetViewports) RealRSSetViewports(ctx, count, viewports);
+            return;
+        }
+        // Only clamp inside a detected scene
+        if (!g_sceneActive.load(std::memory_order_relaxed)) {
+            if (RealRSSetViewports) RealRSSetViewports(ctx, count, viewports);
+            return;
+        }
+        // Determine target per-eye output size (prefer left/right max)
+        uint32_t outLw=0, outLh=0, outRw=0, outRh=0;
+        (void)DLSSHooks::GetPerEyeDisplaySize(0, outLw, outLh);
+        (void)DLSSHooks::GetPerEyeDisplaySize(1, outRw, outRh);
+        uint32_t tgtOutW = outLw ? outLw : outRw;
+        uint32_t tgtOutH = outLh ? outLh : outRh;
+        if (tgtOutW == 0 || tgtOutH == 0) {
+            // Fallback to scene RT size (not ideal for SxS atlases)
+            tgtOutW = g_sceneRTDesc.Width;
+            tgtOutH = g_sceneRTDesc.Height;
+        }
+        // Compute predicted render size
+        uint32_t prW=0, prH=0;
+        if (!g_dlssManager || !g_dlssManager->ComputeRenderSizeForOutput(tgtOutW, tgtOutH, prW, prH)) {
+            if (RealRSSetViewports) RealRSSetViewports(ctx, count, viewports);
+            return;
+        }
+        if (prW == 0 || prH == 0) {
+            if (RealRSSetViewports) RealRSSetViewports(ctx, count, viewports);
+            return;
+        }
+        // Prepare a modified copy of the viewport array
+        std::vector<D3D11_VIEWPORT> vps(viewports, viewports + count);
+        bool anyClamped = false;
+        auto approxEq = [](float a, float b) {
+            float diff = fabsf(a - b);
+            float tol = b * 0.05f; // 5% tolerance
+            return diff <= std::max(2.0f, tol);
+        };
+        for (UINT i = 0; i < count; ++i) {
+            D3D11_VIEWPORT& vp = vps[i];
+            if (approxEq(vp.Width, (float)tgtOutW) && approxEq(vp.Height, (float)tgtOutH)) {
+                if (!approxEq(vp.Width, (float)prW) || !approxEq(vp.Height, (float)prH)) {
+                    if (g_dlssConfig->debugEarlyDlss && g_clampLogBudgetPerFrame > 0) {
+                        _MESSAGE("[EarlyDLSS][CLAMP] vp old=(%.0fx%.0f) -> new=(%ux%u)", vp.Width, vp.Height, prW, prH);
+                        --g_clampLogBudgetPerFrame;
+                    }
+                    vp.Width  = (float)prW;
+                    vp.Height = (float)prH;
+                    anyClamped = true;
+                }
+            }
+        }
+        if (RealRSSetViewports) {
+            RealRSSetViewports(ctx, count, vps.data());
+        }
+        (void)anyClamped;
+    }
+}
