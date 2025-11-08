@@ -106,6 +106,16 @@ namespace {
     static std::unordered_map<ID3D11Texture2D*, RedirectEntry> g_redirectMap;
     static std::mutex g_redirectMutex;
 
+    static void CleanupRedirectCache() {
+        std::lock_guard<std::mutex> lock(g_redirectMutex);
+        for (auto& kv : g_redirectMap) {
+            RedirectEntry& e = kv.second;
+            if (e.smallRTV) { e.smallRTV->Release(); e.smallRTV = nullptr; }
+            if (e.smallTex) { e.smallTex->Release(); e.smallTex = nullptr; }
+        }
+        g_redirectMap.clear();
+    }
+
 
     void SafeAssignTexture(ID3D11Texture2D*& target, ID3D11Texture2D* source) {
         if (target == source) {
@@ -173,7 +183,10 @@ namespace {
     bool EnsureDLSSRuntimeReady();
 }
 
-\n// fwd decl\nstatic ID3D11RenderTargetView* GetOrCreateSmallRTVFor(ID3D11RenderTargetView* bigRTV, UINT prW, UINT prH);\nnamespace DLSSHooks {
+// fwd decl
+static ID3D11RenderTargetView* GetOrCreateSmallRTVFor(ID3D11RenderTargetView* bigRTV, UINT prW, UINT prH);
+static void CompositeIfNeededOnBigBind(ID3D11RenderTargetView* bigRTV);
+namespace DLSSHooks {
     PFN_Present RealPresent = nullptr;
     PFN_ResizeBuffers RealResizeBuffers = nullptr;
     PFN_CreateTexture2D RealCreateTexture2D = nullptr;
@@ -355,6 +368,14 @@ HRESULT WINAPI HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT
         DXGI_FORMAT NewFormat,
         UINT SwapChainFlags) {
         _MESSAGE("ResizeBuffers called: %ux%u", Width, Height);
+
+        // Clear redirect caches and per-frame scene state on resize
+        CleanupRedirectCache();
+        g_sceneActive.store(false, std::memory_order_relaxed);
+        g_sceneRTDesc = {};
+        g_clampLogBudgetPerFrame = 4;
+        g_compositedThisFrame = false;
+        g_redirectUsedThisFrame.store(false, std::memory_order_relaxed);
 
         if (g_imguiBackendInitialized) {
             ShutdownImGuiBackend();
