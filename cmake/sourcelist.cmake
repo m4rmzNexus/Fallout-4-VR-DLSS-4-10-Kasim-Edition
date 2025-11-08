@@ -1,0 +1,16 @@
+set(sources
+    src/main.cpp
+    src/F4SEVR_Upscaler.cpp
+    src/ImGui_Menu.cpp
+    dlss_config.cpp
+    dlss_hooks.cpp
+    dlss_manager.cpp
+    src/backends/SLBackend.cpp
+    third_party/imgui/imgui.cpp
+    third_party/imgui/imgui_draw.cpp
+    third_party/imgui/imgui_tables.cpp
+    third_party/imgui/imgui_widgets.cpp
+    third_party/imgui/imgui_demo.cpp
+    third_party/imgui/backends/imgui_impl_dx11.cpp
+    third_party/imgui/backends/imgui_impl_win32.cpp
+)
