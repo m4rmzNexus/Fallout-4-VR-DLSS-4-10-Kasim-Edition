@@ -61,6 +61,16 @@ private:
     sl::FrameToken* m_frameToken = nullptr;
     bool m_frameActive = false;
     uint32_t m_frameEyeCount = 0;
+
+    // Scratch fallback resources to ensure DLSS gets clonable SRV/UAV textures
+    ID3D11Texture2D* m_scratchIn[kMaxEyes]{};
+    ID3D11Texture2D* m_scratchOut[kMaxEyes]{};
+    unsigned int m_scratchInW[kMaxEyes]{};
+    unsigned int m_scratchInH[kMaxEyes]{};
+    DXGI_FORMAT m_scratchInFmt[kMaxEyes]{};
+    unsigned int m_scratchOutW[kMaxEyes]{};
+    unsigned int m_scratchOutH[kMaxEyes]{};
+    DXGI_FORMAT m_scratchOutFmt[kMaxEyes]{};
 #endif
 };
 

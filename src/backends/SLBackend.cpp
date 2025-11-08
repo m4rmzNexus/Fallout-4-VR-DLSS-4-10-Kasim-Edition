@@ -178,6 +178,12 @@ void SLBackend::Shutdown() {
 #ifdef USE_STREAMLINE
     if (m_ready) {
         for (int i = 0; i < kMaxEyes; ++i) {
+            if (m_scratchIn[i]) { m_scratchIn[i]->Release(); m_scratchIn[i] = nullptr; }
+            if (m_scratchOut[i]) { m_scratchOut[i]->Release(); m_scratchOut[i] = nullptr; }
+            m_scratchInW[i] = m_scratchInH[i] = 0; m_scratchInFmt[i] = DXGI_FORMAT_UNKNOWN;
+            m_scratchOutW[i] = m_scratchOutH[i] = 0; m_scratchOutFmt[i] = DXGI_FORMAT_UNKNOWN;
+        }
+        for (int i = 0; i < kMaxEyes; ++i) {
             if (m_vpAllocated[i] && m_viewports[i] != 0) {
                 slFreeResources(sl::kFeatureDLSS, m_viewports[i]);
                 m_vpAllocated[i] = false;
@@ -300,24 +306,50 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
             _ERROR("[SL] Output too large for DLSS (%ux%u) - reduce VR SS; falling back to native this frame", outputWidth, outputHeight);
             return inputColor;
         }
-        m_options.outputWidth = outputWidth;
-        m_options.outputHeight = outputHeight;
-        (void)slDLSSSetOptions(viewport, m_options);
-        if (vpAllocated) {
-            slFreeResources(sl::kFeatureDLSS, viewport);
-            vpAllocated = false;
-        }
+        // Free any previous allocations for this viewport; Streamline will re-allocate lazily on evaluate
+        slFreeResources(sl::kFeatureDLSS, viewport);
+        vpAllocated = false;
     }
 
     // Wrap resources
     D3D11_TEXTURE2D_DESC inDesc{};
     inputColor->GetDesc(&inDesc);
 
+    // Decide on scratch fallback for input
+    const bool needScratchIn = (inDesc.Usage != D3D11_USAGE_DEFAULT) || (inDesc.SampleDesc.Count > 1) || ((inDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0);
+
+    ID3D11Texture2D* tagInput = inputColor;
+    if (needScratchIn) {
+        // Create or resize scratch input (SRV-capable)
+        bool create = (m_scratchIn[eyeIndex] == nullptr) || m_scratchInW[eyeIndex] != renderWidth || m_scratchInH[eyeIndex] != renderHeight || m_scratchInFmt[eyeIndex] != inDesc.Format;
+        if (create) {
+            if (m_scratchIn[eyeIndex]) { m_scratchIn[eyeIndex]->Release(); m_scratchIn[eyeIndex] = nullptr; }
+            D3D11_TEXTURE2D_DESC s{};
+            s.Width = renderWidth; s.Height = renderHeight; s.MipLevels = 1; s.ArraySize = 1;
+            s.Format = inDesc.Format; s.SampleDesc.Count = 1; s.SampleDesc.Quality = 0;
+            s.Usage = D3D11_USAGE_DEFAULT; s.BindFlags = D3D11_BIND_SHADER_RESOURCE; s.CPUAccessFlags = 0; s.MiscFlags = 0;
+            HRESULT hr = m_device->CreateTexture2D(&s, nullptr, &m_scratchIn[eyeIndex]);
+            if (FAILED(hr)) {
+                _ERROR("[SL] Failed to create scratch input texture (hr=0x%08X)", (unsigned)hr);
+            } else {
+                m_scratchInW[eyeIndex] = renderWidth; m_scratchInH[eyeIndex] = renderHeight; m_scratchInFmt[eyeIndex] = inDesc.Format;
+            }
+        }
+        if (m_scratchIn[eyeIndex]) {
+            // Copy region from source to scratch
+            D3D11_BOX srcBox{}; srcBox.left = 0; srcBox.top = 0; srcBox.front = 0; srcBox.right = renderWidth; srcBox.bottom = renderHeight; srcBox.back = 1;
+            m_context->CopySubresourceRegion(m_scratchIn[eyeIndex], 0, 0, 0, 0, inputColor, 0, &srcBox);
+            tagInput = m_scratchIn[eyeIndex];
+        } else {
+            tagInput = inputColor; // fallback to original
+        }
+    }
+
     sl::Resource color{};
-    color.native = static_cast<void*>(static_cast<ID3D11Resource*>(inputColor));
+    color.native = static_cast<void*>(static_cast<ID3D11Resource*>(tagInput));
     color.type = sl::ResourceType::eTex2d;
-    color.width = inDesc.Width;
-    color.height = inDesc.Height;
+    color.width = needScratchIn ? renderWidth : inDesc.Width;
+    color.height = needScratchIn ? renderHeight : inDesc.Height;
     color.nativeFormat = static_cast<uint32_t>(inDesc.Format);
 
     // Build extents as full-rects (left=0, top=0) and clamp to resource sizes
@@ -331,10 +363,10 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
         return e;
     };
 
-    const sl::Extent inExtent = clampTo(renderWidth, renderHeight, inDesc.Width, inDesc.Height);
+    const sl::Extent inExtent = clampTo(renderWidth, renderHeight, color.width, color.height);
 
     sl::ResourceTag tags[5] = {
-        sl::ResourceTag(&color, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow, &inExtent)
+        sl::ResourceTag(&color, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &inExtent)
     };
     uint32_t numTags = 1;
 
@@ -346,7 +378,7 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
         depth.width = d.Width; depth.height = d.Height;
         depth.nativeFormat = static_cast<uint32_t>(ResolveDepthFormat(d.Format));
         const sl::Extent dpExtent = clampTo(renderWidth, renderHeight, d.Width, d.Height);
-        tags[numTags++] = sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &dpExtent);
+        tags[numTags++] = sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate, &dpExtent);
     }
 
     sl::Resource mv{};
@@ -356,22 +388,49 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
         mv.type = sl::ResourceType::eTex2d;
         mv.width = m.Width; mv.height = m.Height; mv.nativeFormat = static_cast<uint32_t>(m.Format);
         const sl::Extent mvExtent = clampTo(renderWidth, renderHeight, m.Width, m.Height);
-        tags[numTags++] = sl::ResourceTag(&mv, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow, &mvExtent);
+        tags[numTags++] = sl::ResourceTag(&mv, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &mvExtent);
     }
 
+    // Output: prefer provided target if UAV-capable; else use scratch output
     sl::Resource out{};
-    if (outputTarget) {
-        D3D11_TEXTURE2D_DESC o{}; outputTarget->GetDesc(&o);
-        out.native = static_cast<void*>(static_cast<ID3D11Resource*>(outputTarget));
+    ID3D11Texture2D* tagOutput = outputTarget;
+    D3D11_TEXTURE2D_DESC o{};
+    bool usingScratchOut = false;
+    if (outputTarget) { outputTarget->GetDesc(&o); }
+    const bool needScratchOut = (!outputTarget) || (o.Usage != D3D11_USAGE_DEFAULT) || (o.SampleDesc.Count > 1) || ((o.BindFlags & D3D11_BIND_UNORDERED_ACCESS) == 0);
+    if (needScratchOut) {
+        DXGI_FORMAT outFmt = outputTarget ? o.Format : DXGI_FORMAT_R8G8B8A8_UNORM;
+        bool create = (m_scratchOut[eyeIndex] == nullptr) || m_scratchOutW[eyeIndex] != outputWidth || m_scratchOutH[eyeIndex] != outputHeight || m_scratchOutFmt[eyeIndex] != outFmt;
+        if (create) {
+            if (m_scratchOut[eyeIndex]) { m_scratchOut[eyeIndex]->Release(); m_scratchOut[eyeIndex] = nullptr; }
+            D3D11_TEXTURE2D_DESC s{};
+            s.Width = outputWidth; s.Height = outputHeight; s.MipLevels = 1; s.ArraySize = 1;
+            s.Format = outFmt; s.SampleDesc.Count = 1; s.SampleDesc.Quality = 0;
+            s.Usage = D3D11_USAGE_DEFAULT; s.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE; s.CPUAccessFlags = 0; s.MiscFlags = 0;
+            HRESULT hr = m_device->CreateTexture2D(&s, nullptr, &m_scratchOut[eyeIndex]);
+            if (FAILED(hr)) {
+                _ERROR("[SL] Failed to create scratch output texture (hr=0x%08X)", (unsigned)hr);
+            } else {
+                m_scratchOutW[eyeIndex] = outputWidth; m_scratchOutH[eyeIndex] = outputHeight; m_scratchOutFmt[eyeIndex] = outFmt;
+            }
+        }
+        if (m_scratchOut[eyeIndex]) {
+            tagOutput = m_scratchOut[eyeIndex];
+            usingScratchOut = true;
+            // refresh desc 'o' to point to scratch dims
+            o.Width = outputWidth; o.Height = outputHeight; o.Format = m_scratchOutFmt[eyeIndex];
+        }
+    }
+    if (tagOutput) {
+        out.native = static_cast<void*>(static_cast<ID3D11Resource*>(tagOutput));
         out.type = sl::ResourceType::eTex2d;
         out.width = o.Width; out.height = o.Height; out.nativeFormat = static_cast<uint32_t>(o.Format);
-        const sl::Extent clampedOutExtent = clampTo(outputWidth, outputHeight, o.Width, o.Height);
-        tags[numTags++] = sl::ResourceTag(&out, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eOnlyValidNow, &clampedOutExtent);
+        const sl::Extent clampedOutExtent = clampTo(outputWidth, outputHeight, out.width, out.height);
+        tags[numTags++] = sl::ResourceTag(&out, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &clampedOutExtent);
     }
 
     m_options.outputWidth = outputWidth;
     m_options.outputHeight = outputHeight;
-    (void)slDLSSSetOptions(viewport, m_options);
     sl::Constants consts{};
     consts.mvecScale.x = (renderWidth > 0) ? (1.0f / (float)renderWidth) : 1.0f;
     consts.mvecScale.y = (renderHeight > 0) ? (1.0f / (float)renderHeight) : 1.0f;
@@ -407,25 +466,16 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
     consts.cameraMotionIncluded = sl::Boolean::eFalse;
     consts.motionVectors3D = sl::Boolean::eFalse;
     consts.reset = resetHistory ? sl::Boolean::eTrue : sl::Boolean::eFalse;
-    (void)slSetConstants(consts, *m_frameToken, viewport);
-
+    // Per-eye tagging order:
+    // 1) Tags -> 2) Constants -> 3) Options -> 4) Evaluate
     // D3D11: pass immediate context as command buffer to SL
     sl::Result rt = slSetTagForFrame(*m_frameToken, viewport, tags, numTags, reinterpret_cast<sl::CommandBuffer*>(m_context));
     if (rt != sl::Result::eOk) {
         _ERROR("[SL] slSetTagForFrame failed: %d (tags=%u)", (int)rt, numTags);
     }
 
-    // Allocate after options + tags are set, so the plugin has full context
-    if (needRealloc) {
-        sl::Result ar = slAllocateResources(reinterpret_cast<sl::CommandBuffer*>(m_context), sl::kFeatureDLSS, viewport);
-        if (ar != sl::Result::eOk) {
-            _ERROR("[SL] slAllocateResources failed: %d (in=%ux%u out=%ux%u)", (int)ar, renderWidth, renderHeight, outputWidth, outputHeight);
-            // Do not early-return; DLSS can lazy-init on evaluate in some builds.
-        } else {
-            vpAllocated = true;
-            vpInW = renderWidth; vpInH = renderHeight; vpOutW = outputWidth; vpOutH = outputHeight;
-        }
-    }
+    (void)slSetConstants(consts, *m_frameToken, viewport);
+    (void)slDLSSSetOptions(viewport, m_options);
 
     _MESSAGE("[SL] ProcessEye: eye=%d", eyeIndex);
     _MESSAGE("[SL] Evaluate: in=%ux%u(outTex=%ux%u) out=%ux%u(outTex=%ux%u) depth=%d mv=%d",
@@ -473,13 +523,22 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
         // Clear any error state after consistent success
     }
 
+    // If we used scratch output and a real output target exists with same format/size, copy result back
+    if (usingScratchOut && outputTarget && m_scratchOut[eyeIndex]) {
+        // Only copy if formats and dimensions match exactly
+        if (o.Format == m_scratchOutFmt[eyeIndex] && o.Width == m_scratchOutW[eyeIndex] && o.Height == m_scratchOutH[eyeIndex]) {
+            m_context->CopyResource(outputTarget, m_scratchOut[eyeIndex]);
+        }
+    }
+
     ++m_frameEyeCount;
     if (m_frameEyeCount >= kMaxEyes) {
         EndFrame();
     }
 
-    // Return output if provided; otherwise return input
-    return outputTarget ? outputTarget : inputColor;
+    // Return chosen output if available; otherwise return input
+    if (tagOutput) return tagOutput;
+    return tagInput ? tagInput : inputColor;
 #endif
 }
 
