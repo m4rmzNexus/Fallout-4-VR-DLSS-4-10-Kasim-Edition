@@ -173,7 +173,7 @@ namespace {
     bool EnsureDLSSRuntimeReady();
 }
 
-namespace DLSSHooks {
+\n// fwd decl\nstatic ID3D11RenderTargetView* GetOrCreateSmallRTVFor(ID3D11RenderTargetView* bigRTV, UINT prW, UINT prH);\nnamespace DLSSHooks {
     PFN_Present RealPresent = nullptr;
     PFN_ResizeBuffers RealResizeBuffers = nullptr;
     PFN_CreateTexture2D RealCreateTexture2D = nullptr;
@@ -1225,7 +1225,9 @@ namespace DLSSHooks {
         return true;
     }
 
-    void STDMETHODCALLTYPE HookedOMSetRenderTargets(ID3D11DeviceContext* ctx, UINT numRTVs, ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV) {`n        // Composite small->big if a post/HUD big RT is bound after redirect`n        if (ppRTVs && numRTVs>0 && ppRTVs[0]) { CompositeIfNeededOnBigBind(ppRTVs[0]); }
+    void STDMETHODCALLTYPE HookedOMSetRenderTargets(ID3D11DeviceContext* ctx, UINT numRTVs, ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV) {
+        // Composite small->big if a post/HUD big RT is bound after redirect
+        if (ppRTVs && numRTVs > 0 && ppRTVs[0]) { CompositeIfNeededOnBigBind(ppRTVs[0]); }
         if (!ppRTVs || numRTVs == 0 || !ppRTVs[0]) {
             if (RealOMSetRenderTargets) RealOMSetRenderTargets(ctx, numRTVs, ppRTVs, pDSV);
             return;
