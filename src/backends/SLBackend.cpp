@@ -69,8 +69,10 @@ bool SLBackend::Init(ID3D11Device* device, ID3D11DeviceContext* context) {
     const wchar_t* paths[] = { gameDir.c_str() };
 
     sl::Preferences pref{};
-    pref.showConsole = false;
-    pref.logLevel = sl::LogLevel::eDefault;
+    // Maximize Streamline logging for debugging runs
+    pref.showConsole = true;
+    pref.logLevel = sl::LogLevel::eVerbose;
+    pref.logMessageCallback = SLLogCallback;
     pref.pathsToPlugins = paths;
     pref.numPathsToPlugins = 1;
     pref.pathToLogsAndData = logs.c_str();
@@ -291,8 +293,9 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
         viewport = sl::ViewportHandle(eyeIndex + 1);
     }
 
-    if (!vpAllocated || vpInW != renderWidth || vpInH != renderHeight || vpOutW != outputWidth || vpOutH != outputHeight) {
-        // Hard safety: DLSS has practical limits (~8K). If output exceeds, skip allocation this frame.
+    bool needRealloc = (!vpAllocated || vpInW != renderWidth || vpInH != renderHeight || vpOutW != outputWidth || vpOutH != outputHeight);
+    if (needRealloc) {
+        // Hard safety: DLSS has practical limits (~8K). If output exceeds, skip DLSS for this frame.
         if (outputWidth > 8192u || outputHeight > 8192u) {
             _ERROR("[SL] Output too large for DLSS (%ux%u) - reduce VR SS; falling back to native this frame", outputWidth, outputHeight);
             return inputColor;
@@ -304,13 +307,6 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
             slFreeResources(sl::kFeatureDLSS, viewport);
             vpAllocated = false;
         }
-        // Allocate DLSS resources for this viewport (D3D11: cmdBuffer = nullptr)
-        if (sl::Result ar = slAllocateResources(nullptr, sl::kFeatureDLSS, viewport); ar != sl::Result::eOk) {
-            _ERROR("[SL] slAllocateResources failed: %d (in=%ux%u out=%ux%u)", (int)ar, renderWidth, renderHeight, outputWidth, outputHeight);
-            return inputColor;
-        }
-        vpAllocated = true;
-        vpInW = renderWidth; vpInH = renderHeight; vpOutW = outputWidth; vpOutH = outputHeight;
     }
 
     // Wrap resources
@@ -370,15 +366,28 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
     consts.reset = resetHistory ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     (void)slSetConstants(consts, *m_frameToken, viewport);
 
-    sl::Result rt = slSetTagForFrame(*m_frameToken, viewport, tags, numTags, nullptr);
+    // D3D11: pass immediate context as command buffer to SL
+    sl::Result rt = slSetTagForFrame(*m_frameToken, viewport, tags, numTags, reinterpret_cast<sl::CommandBuffer*>(m_context));
     if (rt != sl::Result::eOk) {
         _ERROR("[SL] slSetTagForFrame failed: %d (tags=%u)", (int)rt, numTags);
+    }
+
+    // Allocate after options + tags are set, so the plugin has full context
+    if (needRealloc) {
+        sl::Result ar = slAllocateResources(reinterpret_cast<sl::CommandBuffer*>(m_context), sl::kFeatureDLSS, viewport);
+        if (ar != sl::Result::eOk) {
+            _ERROR("[SL] slAllocateResources failed: %d (in=%ux%u out=%ux%u)", (int)ar, renderWidth, renderHeight, outputWidth, outputHeight);
+            // Do not early-return; DLSS can lazy-init on evaluate in some builds.
+        } else {
+            vpAllocated = true;
+            vpInW = renderWidth; vpInH = renderHeight; vpOutW = outputWidth; vpOutH = outputHeight;
+        }
     }
 
     _MESSAGE("[SL] ProcessEye: eye=%d", eyeIndex);
     _MESSAGE("[SL] Evaluate: in=%ux%u out=%ux%u depth=%d mv=%d", renderWidth, renderHeight, outputWidth, outputHeight, inputDepth?1:0, inputMotionVectors?1:0);
     const sl::BaseStructure* inputs[] = { reinterpret_cast<const sl::BaseStructure*>(&viewport) };
-    sl::Result rEval = slEvaluateFeature(sl::kFeatureDLSS, *m_frameToken, inputs, 1, nullptr);
+    sl::Result rEval = slEvaluateFeature(sl::kFeatureDLSS, *m_frameToken, inputs, 1, reinterpret_cast<sl::CommandBuffer*>(m_context));
     if (rEval != sl::Result::eOk) {
         _ERROR("[SL] slEvaluateFeature failed: %d", (int)rEval);
         
