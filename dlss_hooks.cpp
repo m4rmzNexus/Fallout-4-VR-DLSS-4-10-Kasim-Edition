@@ -37,6 +37,9 @@ extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam
 template <typename T>
 bool HookVTableFunction(void* pVTable, int index, T hookFunc, T* originalFunc);
 
+// Forward declaration so we can call it before its definition
+namespace DLSSHooks { void InstallContextHooks(ID3D11DeviceContext* ctx); }
+
 namespace {
     ID3D11Device* g_device = nullptr;
     ID3D11DeviceContext* g_context = nullptr;
@@ -190,6 +193,7 @@ namespace DLSSHooks {
     PFN_Present RealPresent = nullptr;
     PFN_ResizeBuffers RealResizeBuffers = nullptr;
     PFN_CreateTexture2D RealCreateTexture2D = nullptr;
+    PFN_CreateDeferredContext RealCreateDeferredContext = nullptr;
     PFN_FactoryCreateSwapChain RealFactoryCreateSwapChain = nullptr;
     PFN_RSSetViewports RealRSSetViewports = nullptr;
     PFN_OMSetRenderTargets RealOMSetRenderTargets = nullptr;
@@ -630,11 +634,47 @@ namespace {
                     }
                     recW = (uint32_t)std::max(1.0, uSpan * (double)fullW);
                     recH = (uint32_t)std::max(1.0, vSpan * (double)fullH);
+                    // If bounds cover the whole texture (or are missing), try to detect atlas (SxS or top-bottom)
+                    const bool fullSpan = (uSpan > 0.99 && vSpan > 0.99) || !bounds;
+                    if (fullSpan) {
+                        // Heuristic atlas detection
+                        if (fullW >= (uint32_t)((double)fullH * 1.7)) {
+                            // side-by-side
+                            recW = fullW / 2u;
+                            recH = fullH;
+                            if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
+                                _MESSAGE("[EarlyDLSS][SIZE] SxS atlas detected: per-eye=%ux%u from full=%ux%u", recW, recH, fullW, fullH);
+                            }
+                        } else if (fullH >= (uint32_t)((double)fullW * 1.7)) {
+                            // top-bottom
+                            recW = fullW;
+                            recH = fullH / 2u;
+                            if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
+                                _MESSAGE("[EarlyDLSS][SIZE] T/B atlas detected: per-eye=%ux%u from full=%ux%u", recW, recH, fullW, fullH);
+                            }
+                        }
+                    }
                 }
             }
-            // even-align and clamp
+            // even-align
             recW &= ~1u; recH &= ~1u;
-            if (recW > 8192u) recW = 8192u; if (recH > 8192u) recH = 8192u;
+            // Optional per-eye cap to keep sizes sane
+            if (g_dlssConfig && g_dlssConfig->enablePerEyeCap && g_dlssConfig->perEyeMaxDim > 0) {
+                const uint32_t cap = (uint32_t)g_dlssConfig->perEyeMaxDim;
+                uint32_t maxDim = recW > recH ? recW : recH;
+                if (maxDim > cap && maxDim > 0) {
+                    const double scale = (double)cap / (double)maxDim;
+                    uint32_t newW = (uint32_t)std::max(1.0, std::floor((double)recW * scale));
+                    uint32_t newH = (uint32_t)std::max(1.0, std::floor((double)recH * scale));
+                    // even-align after scale
+                    newW &= ~1u; newH &= ~1u;
+                    if (newW == 0) newW = 2; if (newH == 0) newH = 2;
+                    if (g_dlssConfig->debugEarlyDlss) {
+                        _MESSAGE("[EarlyDLSS][SIZE] Cap applied: %ux%u -> %ux%u (cap=%u)", recW, recH, newW, newH, cap);
+                    }
+                    recW = newW; recH = newH;
+                }
+            }
             const int idx = (eye == vr::Eye_Left) ? 0 : 1;
             if (recW > 0 && recH > 0) {
                 g_perEyeOutW[idx].store(recW, std::memory_order_relaxed);
@@ -701,27 +741,78 @@ namespace {
                               g_lastEvaluateOk.load(std::memory_order_relaxed) &&
                               processedTexture && (processedTexture != colorTexture);
 
+        // Validate sample count for processed texture; allow different dimensions
         if (canUseUpscaled) {
-            D3D11_TEXTURE2D_DESC inDesc{}; colorTexture->GetDesc(&inDesc);
             D3D11_TEXTURE2D_DESC outDesc{}; processedTexture->GetDesc(&outDesc);
-            if (outDesc.SampleDesc.Count != 1 ||
-                outDesc.Width != inDesc.Width ||
-                outDesc.Height != inDesc.Height) {
+            if (outDesc.SampleDesc.Count != 1) {
                 canUseUpscaled = false;
             }
         }
 
         if (canUseUpscaled) {
+            // Prefer safest path: keep original texture handle for VR compositor and copy/blit DLSS result into it
+            D3D11_TEXTURE2D_DESC inDesc{}; colorTexture->GetDesc(&inDesc);
+            D3D11_TEXTURE2D_DESC outDesc{}; processedTexture->GetDesc(&outDesc);
+
+            bool submitted = false;
+            bool copied = false;
+            do {
+                // Fast path: exact match copy
+                if (inDesc.Width == outDesc.Width && inDesc.Height == outDesc.Height && inDesc.Format == outDesc.Format) {
+                    if (g_device && g_context) {
+                        g_context->CopyResource(colorTexture, processedTexture);
+                        _MESSAGE("[DLSS][Submit] Copied DLSS output into original eye texture (CopyResource)");
+                        copied = true;
+                    }
+                }
+                if (!copied && g_dlssManager && g_device) {
+                    // Try linear blit into original using an RTV on the original eye texture
+                    ID3D11RenderTargetView* rtv = nullptr;
+                    if (SUCCEEDED(g_device->CreateRenderTargetView(colorTexture, nullptr, &rtv)) && rtv) {
+                        if (g_dlssManager->BlitToRTV(processedTexture, rtv, inDesc.Width, inDesc.Height)) {
+                            _MESSAGE("[DLSS][Submit] Copied DLSS output into original eye texture (Blit)");
+                            copied = true;
+                        }
+                        rtv->Release();
+                    }
+                }
+                // Submit original texture (with original bounds) after copy/blit
+                if (copied) {
+                    if (flags & vr::Submit_TextureWithDepth) {
+                        const vr::VRTextureWithDepth_t* orig = reinterpret_cast<const vr::VRTextureWithDepth_t*>(texture);
+                        return g_realVRSubmit(self, eye, reinterpret_cast<const vr::Texture_t*>(orig), bounds, flags);
+                    }
+                    return g_realVRSubmit(self, eye, texture, bounds, flags);
+                }
+            } while (false);
+
+            // Fallback: replace handle if copy/blit failed; fix bounds when atlas->single conversion likely
+            const vr::VRTextureBounds_t* submitBounds = bounds;
+            vr::VRTextureBounds_t fixedBounds{ 0.0f, 1.0f, 0.0f, 1.0f };
+            const bool dimsDiffer = (inDesc.Width != outDesc.Width) || (inDesc.Height != outDesc.Height);
+            if (dimsDiffer && bounds) {
+                const float uSpan = static_cast<float>(bounds->uMax - bounds->uMin);
+                const float vSpan = static_cast<float>(bounds->vMax - bounds->vMin);
+                const bool approxHalfU = (uSpan > 0.48f && uSpan < 0.52f);
+                const bool approxHalfV = (vSpan > 0.48f && vSpan < 0.52f);
+                const bool likelySxS = approxHalfU && (outDesc.Width * 2u <= inDesc.Width + 8u);
+                const bool likelyTB  = approxHalfV && (outDesc.Height * 2u <= inDesc.Height + 8u);
+                if (likelySxS || likelyTB) {
+                    submitBounds = &fixedBounds;
+                    _MESSAGE("[DLSS][Submit] Adjusted bounds for per-eye output (atlas->single)");
+                }
+            }
+
+            _MESSAGE("[DLSS][Submit] Fallback to handle replacement path");
             if (flags & vr::Submit_TextureWithDepth) {
                 vr::VRTextureWithDepth_t textureCopy = *reinterpret_cast<const vr::VRTextureWithDepth_t*>(texture);
                 textureCopy.handle = processedTexture;
-                return g_realVRSubmit(self, eye, reinterpret_cast<const vr::Texture_t*>(&textureCopy), bounds, flags);
+                return g_realVRSubmit(self, eye, reinterpret_cast<const vr::Texture_t*>(&textureCopy), submitBounds, flags);
             }
-
             vr::Texture_t textureCopy = *texture;
             textureCopy.handle = processedTexture;
             textureCopy.eType = vr::TextureType_DirectX;
-            return g_realVRSubmit(self, eye, &textureCopy, bounds, flags);
+            return g_realVRSubmit(self, eye, &textureCopy, submitBounds, flags);
         }
 
         return g_realVRSubmit(self, eye, texture, bounds, flags);
@@ -793,11 +884,13 @@ namespace {
             ID3D11DeviceContext* ctx = nullptr;
             device->GetImmediateContext(&ctx);
             if (ctx) {
-                HookVTableFunction(ctx, 33, DLSSHooks::HookedOMSetRenderTargets, &DLSSHooks::RealOMSetRenderTargets);
-                HookVTableFunction(ctx, 44, DLSSHooks::HookedRSSetViewports, &DLSSHooks::RealRSSetViewports);
+                DLSSHooks::InstallContextHooks(ctx);
                 _MESSAGE("Immediate context hooks installed (OMSetRenderTargets, RSSetViewports)");
                 ctx->Release();
             }
+            // Hook CreateDeferredContext to reach all deferred contexts
+            HookVTableFunction(device, 27, DLSSHooks::HookedCreateDeferredContext, &DLSSHooks::RealCreateDeferredContext);
+            _MESSAGE("ID3D11Device::CreateDeferredContext hook installed");
         } else {
             g_deviceHookInstalled = false;
             _ERROR("Failed to hook ID3D11Device::CreateTexture2D");
@@ -958,6 +1051,26 @@ namespace DLSSHooks {
 
         DetectSpecialTextures(*desc, *texture);
         return result;
+    }
+
+    // Install OMSetRenderTargets and RSSetViewports hooks on a given context
+    static void InstallContextHooks(ID3D11DeviceContext* ctx) {
+        if (!ctx) return;
+        HookVTableFunction(ctx, 33, DLSSHooks::HookedOMSetRenderTargets, &DLSSHooks::RealOMSetRenderTargets);
+        HookVTableFunction(ctx, 44, DLSSHooks::HookedRSSetViewports, &DLSSHooks::RealRSSetViewports);
+    }
+
+    // Hook ID3D11Device::CreateDeferredContext to ensure deferred contexts are also hooked
+    HRESULT STDMETHODCALLTYPE HookedCreateDeferredContext(ID3D11Device* device, UINT ContextFlags, ID3D11DeviceContext** ppDeferredContext) {
+        if (!RealCreateDeferredContext) {
+            return E_FAIL;
+        }
+        HRESULT hr = RealCreateDeferredContext(device, ContextFlags, ppDeferredContext);
+        if (SUCCEEDED(hr) && ppDeferredContext && *ppDeferredContext) {
+            InstallContextHooks(*ppDeferredContext);
+            _MESSAGE("Deferred context hooks installed (OMSetRenderTargets, RSSetViewports)");
+        }
+        return hr;
     }
 }
 
@@ -1312,6 +1425,10 @@ namespace DLSSHooks {
         }
         // Only clamp inside a detected scene
         if (!g_sceneActive.load(std::memory_order_relaxed)) {
+            if (g_dlssConfig->debugEarlyDlss && g_clampLogBudgetPerFrame > 0) {
+                _MESSAGE("[EarlyDLSS][CLAMP] skip: no scene active");
+                --g_clampLogBudgetPerFrame;
+            }
             if (RealRSSetViewports) RealRSSetViewports(ctx, count, viewports);
             return;
         }
@@ -1329,16 +1446,25 @@ namespace DLSSHooks {
         // Compute predicted render size
         uint32_t prW=0, prH=0;
         if (!g_dlssManager || !g_dlssManager->ComputeRenderSizeForOutput(tgtOutW, tgtOutH, prW, prH)) {
+            if (g_dlssConfig->debugEarlyDlss && g_clampLogBudgetPerFrame > 0) {
+                _MESSAGE("[EarlyDLSS][CLAMP] skip: no optimal size for %ux%u", tgtOutW, tgtOutH);
+                --g_clampLogBudgetPerFrame;
+            }
             if (RealRSSetViewports) RealRSSetViewports(ctx, count, viewports);
             return;
         }
         if (prW == 0 || prH == 0) {
+            if (g_dlssConfig->debugEarlyDlss && g_clampLogBudgetPerFrame > 0) {
+                _MESSAGE("[EarlyDLSS][CLAMP] skip: predicted size is zero");
+                --g_clampLogBudgetPerFrame;
+            }
             if (RealRSSetViewports) RealRSSetViewports(ctx, count, viewports);
             return;
         }
         // Prepare a modified copy of the viewport array
         std::vector<D3D11_VIEWPORT> vps(viewports, viewports + count);
         bool anyClamped = false;
+        bool anyMatched = false;
         auto approxEq = [](float a, float b) {
             float diff = fabsf(a - b);
             float tol = b * 0.05f; // 5% tolerance
@@ -1347,6 +1473,7 @@ namespace DLSSHooks {
         for (UINT i = 0; i < count; ++i) {
             D3D11_VIEWPORT& vp = vps[i];
             if (approxEq(vp.Width, (float)tgtOutW) && approxEq(vp.Height, (float)tgtOutH)) {
+                anyMatched = true;
                 if (!approxEq(vp.Width, (float)prW) || !approxEq(vp.Height, (float)prH)) {
                     if (g_dlssConfig->debugEarlyDlss && g_clampLogBudgetPerFrame > 0) {
                         _MESSAGE("[EarlyDLSS][CLAMP] vp old=(%.0fx%.0f) -> new=(%ux%u)", vp.Width, vp.Height, prW, prH);
@@ -1355,13 +1482,20 @@ namespace DLSSHooks {
                     vp.Width  = (float)prW;
                     vp.Height = (float)prH;
                     anyClamped = true;
+                } else if (g_dlssConfig->debugEarlyDlss && g_clampLogBudgetPerFrame > 0) {
+                    _MESSAGE("[EarlyDLSS][CLAMP] skip: already at predicted size (%ux%u)", prW, prH);
+                    --g_clampLogBudgetPerFrame;
                 }
             }
         }
         if (RealRSSetViewports) {
             RealRSSetViewports(ctx, count, vps.data());
         }
-        (void)anyClamped;
+        if (!anyClamped && !anyMatched && g_dlssConfig->debugEarlyDlss && g_clampLogBudgetPerFrame > 0) {
+            _MESSAGE("[EarlyDLSS][CLAMP] skip: no matching viewport for target %ux%u", tgtOutW, tgtOutH);
+            --g_clampLogBudgetPerFrame;
+        }
+        (void)anyClamped; (void)anyMatched;
     }
 }
 
@@ -1424,9 +1558,18 @@ static ID3D11RenderTargetView* GetOrCreateSmallRTVFor(ID3D11RenderTargetView* bi
             if (it == g_redirectMap.end() || !it->second.smallTex) { bigTex->Release(); return; }
             entry = it->second;
         }
-        // Use DLSSManager blit helper to copy small->big
+        // Composite small->big; optional HQ path can be enabled via config
         if (g_dlssManager && entry.smallTex) {
-            if (g_dlssManager->BlitToRTV(entry.smallTex, bigRTV, g_sceneRTDesc.Width, g_sceneRTDesc.Height)) {
+            bool ok = false;
+            if (g_dlssConfig && g_dlssConfig->highQualityComposite) {
+                // Placeholder: fall back to linear blit for now
+                if (g_dlssConfig->debugEarlyDlss) {
+                    _MESSAGE("[EarlyDLSS][Composite] HQ path enabled (linear fallback)");
+                }
+            }
+            // Default linear blit
+            ok = g_dlssManager->BlitToRTV(entry.smallTex, bigRTV, g_sceneRTDesc.Width, g_sceneRTDesc.Height);
+            if (ok) {
                 g_compositedThisFrame = true;
                 if (g_dlssConfig->debugEarlyDlss) {
                     _MESSAGE("[EarlyDLSS][Composite] small->big %ux%u", g_sceneRTDesc.Width, g_sceneRTDesc.Height);

@@ -29,6 +29,11 @@ namespace DLSSHooks {
     extern PFN_CreateTexture2D RealCreateTexture2D;
     HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(ID3D11Device* device, const D3D11_TEXTURE2D_DESC* desc, const D3D11_SUBRESOURCE_DATA* initialData, ID3D11Texture2D** texture);
 
+    // Ensure hooks on all contexts (immediate + deferred)
+    typedef HRESULT(STDMETHODCALLTYPE* PFN_CreateDeferredContext)(ID3D11Device* device, UINT ContextFlags, ID3D11DeviceContext** ppDeferredContext);
+    extern PFN_CreateDeferredContext RealCreateDeferredContext;
+    HRESULT STDMETHODCALLTYPE HookedCreateDeferredContext(ID3D11Device* device, UINT ContextFlags, ID3D11DeviceContext** ppDeferredContext);
+
     // DXGI Factory early hook to observe swapchain creation
     typedef HRESULT(STDMETHODCALLTYPE* PFN_FactoryCreateSwapChain)(IDXGIFactory* factory, IUnknown* pDevice, DXGI_SWAP_CHAIN_DESC* pDesc, IDXGISwapChain** ppSwapChain);
     extern PFN_FactoryCreateSwapChain RealFactoryCreateSwapChain;

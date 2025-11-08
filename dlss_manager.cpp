@@ -619,6 +619,17 @@ bool DLSSManager::BlitToRTV(ID3D11Texture2D* src, ID3D11RenderTargetView* dstRTV
     m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_context->VSSetShader(m_fsVS, nullptr, 0);
     m_context->PSSetShader(m_fsPS, nullptr, 0);
+    // Default UV window for full texture copy
+    if (m_fsCB) {
+        D3D11_MAPPED_SUBRESOURCE map{};
+        if (SUCCEEDED(m_context->Map(m_fsCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &map)) && map.pData) {
+            float* p = reinterpret_cast<float*>(map.pData);
+            p[0] = 0.0f; p[1] = 0.0f; p[2] = 1.0f; p[3] = 1.0f;
+            m_context->Unmap(m_fsCB, 0);
+        }
+        ID3D11Buffer* cbs[1] = { m_fsCB };
+        m_context->PSSetConstantBuffers(0, 1, cbs);
+    }
     m_context->PSSetShaderResources(0, 1, &srcSRV);
     m_context->PSSetSamplers(0, 1, &m_linearSampler);
     m_context->Draw(3, 0);
@@ -902,10 +913,12 @@ bool DLSSManager::EnsureDownscaleShaders() {
         return o;
     })";
     const char* psSrc = R"(
+    cbuffer UpscaleCB:register(b0){ float2 gUVOffset; float2 gUVScale; };
     Texture2D srcTex:register(t0);
     SamplerState samLinear:register(s0);
     float4 main(float4 pos:SV_Position, float2 uv:TEX):SV_Target{
-        return srcTex.Sample(samLinear, uv);
+        float2 suv = gUVOffset + uv * gUVScale;
+        return srcTex.Sample(samLinear, suv);
     })";
     ID3DBlob* vsBlob=nullptr; ID3DBlob* psBlob=nullptr; ID3DBlob* err=nullptr;
     HRESULT hr = D3DCompile(vsSrc, strlen(vsSrc), nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0, &vsBlob, &err);
@@ -920,10 +933,24 @@ bool DLSSManager::EnsureDownscaleShaders() {
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     sd.MaxLOD = D3D11_FLOAT32_MAX;
     if (FAILED(m_device->CreateSamplerState(&sd, &m_linearSampler))) return false;
+    // Create constant buffer for UV window
+    D3D11_BUFFER_DESC cbd = {};
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.ByteWidth = 16; // float4
+    cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(m_device->CreateBuffer(&cbd, nullptr, &m_fsCB))) return false;
     return true;
 }
 
-bool DLSSManager::DownscaleToRender(EyeContext& eye, ID3D11Texture2D* inputTexture, uint32_t renderWidth, uint32_t renderHeight) {
+bool DLSSManager::DownscaleToRender(EyeContext& eye,
+                                    ID3D11Texture2D* inputTexture,
+                                    uint32_t renderWidth,
+                                    uint32_t renderHeight,
+                                    float uvOffsetX,
+                                    float uvOffsetY,
+                                    float uvScaleX,
+                                    float uvScaleY) {
     if (!EnsureDownscaleShaders()) return false;
     if (!inputTexture) return false;
     D3D11_TEXTURE2D_DESC inDesc{}; inputTexture->GetDesc(&inDesc);
@@ -973,6 +1000,17 @@ bool DLSSManager::DownscaleToRender(EyeContext& eye, ID3D11Texture2D* inputTextu
     m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_context->VSSetShader(m_fsVS, nullptr, 0);
     m_context->PSSetShader(m_fsPS, nullptr, 0);
+    // Update constant buffer
+    if (m_fsCB) {
+        D3D11_MAPPED_SUBRESOURCE map{};
+        if (SUCCEEDED(m_context->Map(m_fsCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &map)) && map.pData) {
+            float* p = reinterpret_cast<float*>(map.pData);
+            p[0] = uvOffsetX; p[1] = uvOffsetY; p[2] = uvScaleX; p[3] = uvScaleY;
+            m_context->Unmap(m_fsCB, 0);
+        }
+        ID3D11Buffer* cbs[1] = { m_fsCB };
+        m_context->PSSetConstantBuffers(0, 1, cbs);
+    }
     m_context->PSSetShaderResources(0, 1, &inSRV);
     m_context->PSSetSamplers(0, 1, &m_linearSampler);
     m_context->Draw(3, 0);
@@ -1080,16 +1118,27 @@ ID3D11Texture2D* DLSSManager::ProcessEye(EyeContext& eye,
         _MESSAGE("[SL] ProcessEye: rw=%u rh=%u ow=%u oh=%u depth=%d mv=%d reset=%d",
                  renderWidth, renderHeight, perEyeOutW, perEyeOutH,
                  depthTexture?1:0, motionVectors?1:0, (eye.requiresReset||forceReset)?1:0);
-        // If input already matches render size, skip downscale pass and use it directly
-        bool useInputDirect = false;
-        if (inputDesc.Width == renderWidth && inputDesc.Height == renderHeight) {
-            useInputDirect = true;
+        // Decide crop window for per-eye region when game uses stereo atlas
+        float uvOffsetX = 0.0f, uvOffsetY = 0.0f, uvScaleX = 1.0f, uvScaleY = 1.0f;
+        const bool likelySxS = (inputDesc.Width >= (perEyeOutW * 2u - 8u)) && (inputDesc.Width >= inputDesc.Height);
+        const bool likelyTB  = (!likelySxS) && (inputDesc.Height >= (perEyeOutH * 2u - 8u));
+        if (likelySxS) {
+            uvScaleX = 0.5f; uvScaleY = 1.0f;
+            uvOffsetX = isLeftEye ? 0.0f : 0.5f; uvOffsetY = 0.0f;
+        } else if (likelyTB) {
+            uvScaleX = 1.0f; uvScaleY = 0.5f;
+            uvOffsetX = 0.0f; uvOffsetY = isLeftEye ? 0.0f : 0.5f;
+        }
+
+        // If input already matches render size and no cropping is needed, skip blit
+        bool useInputDirect = (uvScaleX == 1.0f && uvScaleY == 1.0f && inputDesc.Width == renderWidth && inputDesc.Height == renderHeight);
+        if (useInputDirect) {
             eye.renderWidth = renderWidth;
             eye.renderHeight = renderHeight;
             eye.requiresReset = true; // first time with direct-path
         } else {
-            // Downscale input color to render size
-            if (!DownscaleToRender(eye, inputTexture, renderWidth, renderHeight)) {
+            // Downscale/crop input color to render size
+            if (!DownscaleToRender(eye, inputTexture, renderWidth, renderHeight, uvOffsetX, uvOffsetY, uvScaleX, uvScaleY)) {
                 return inputTexture;
             }
         }
@@ -1261,6 +1310,11 @@ void DLSSManager::Shutdown() {
         m_device->Release();
         m_device = nullptr;
     }
+
+    if (m_fsVS) { m_fsVS->Release(); m_fsVS = nullptr; }
+    if (m_fsPS) { m_fsPS->Release(); m_fsPS = nullptr; }
+    if (m_linearSampler) { m_linearSampler->Release(); m_linearSampler = nullptr; }
+    if (m_fsCB) { m_fsCB->Release(); m_fsCB = nullptr; }
 
     m_initialized = false;
 }

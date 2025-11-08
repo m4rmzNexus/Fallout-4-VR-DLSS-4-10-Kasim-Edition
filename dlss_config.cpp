@@ -292,6 +292,12 @@ void DLSSConfig::ParseIniFile(const std::string& path) {
                 fov = ParseFloat(value);
             } else if (normalizedKey == "uiscale" || normalizedKey == "menuscale") {
                 uiScale = ClampValue(ParseFloat(value), 0.5f, 3.0f);
+            } else if (normalizedKey == "enablepereyecap") {
+                enablePerEyeCap = StringToBool(value);
+            } else if (normalizedKey == "pereyemaxdim" || normalizedKey == "pereyemaxdimension") {
+                perEyeMaxDim = ClampValue(ParseInt(value), 512, 8192);
+            } else if (normalizedKey == "highqualitycomposite") {
+                highQualityComposite = StringToBool(value);
             }
         } else if (lowerSection == "dlss4" || lowerSection == "dlss") {
             if (normalizedKey == "enabletransformermodel") {
@@ -379,59 +385,64 @@ void DLSSConfig::Save() {
     auto boolToString = [](bool value) { return value ? "true" : "false"; };
 
     file << "; F4SEVR DLSS Plugin Configuration" << std::endl;
-    file << "; Generated automatically - edit with care" << std::endl << std::endl;
+    file << "; Bu dosya otomatik olusturuldu. ImGui menusu ile uyumludur." << std::endl << std::endl;
 
     file << "[Settings]" << std::endl;
-    file << "EnableUpscaler = " << boolToString(enableUpscaler) << std::endl;
-    file << "UpscalerType = " << static_cast<int>(upscalerType) << std::endl;
-    file << "QualityLevel = " << static_cast<int>(quality) << std::endl;
-    file << "Sharpening = " << boolToString(enableSharpening) << std::endl;
-    file << "Sharpness = " << sharpness << std::endl;
-    file << "UseOptimalMipLodBias = " << boolToString(useOptimalMipLodBias) << std::endl;
-    file << "MipLodBias = " << mipLodBias << std::endl;
-    file << "RenderReShadeBeforeUpscaling = " << boolToString(renderReShadeBeforeUpscaling) << std::endl;
-    file << "UpscaleDepthForReShade = " << boolToString(upscaleDepthForReShade) << std::endl;
-    file << "UseTAAForPeriphery = " << boolToString(useTAAForPeriphery) << std::endl;
-    // Early DLSS integration flags
-    file << "EarlyDlssEnabled = " << boolToString(earlyDlssEnabled) << std::endl;
-    file << "EarlyDlssMode = " << earlyDlssMode << std::endl;
-    file << "PeripheryTAAEnabled = " << boolToString(peripheryTAAEnabled) << std::endl;
-    file << "FoveatedRenderingEnabled = " << boolToString(foveatedRenderingEnabled) << std::endl;
-    file << "DebugEarlyDlss = " << boolToString(debugEarlyDlss) << std::endl;
-    file << "DLSSPreset = " << dlssPreset << std::endl;
-    file << "FOV = " << fov << std::endl << std::endl;
-    file << "; UI scale for ImGui menu (0.5 - 3.0). 1.5 is good for VR" << std::endl;
-    file << "UIScale = " << uiScale << std::endl << std::endl;
+    file << "mEnableUpscaler = " << boolToString(enableUpscaler) << std::endl;
+    file << "mUpscalerType = " << static_cast<int>(upscalerType) << std::endl;
+    file << "mQualityLevel = " << static_cast<int>(quality) << std::endl;
+    file << "mSharpening = " << boolToString(enableSharpening) << std::endl;
+    file << "mSharpness = " << sharpness << std::endl;
+    file << "mUseOptimalMipLodBias = " << boolToString(useOptimalMipLodBias) << std::endl;
+    file << "mMipLodBias = " << mipLodBias << std::endl;
+    file << "mRenderReShadeBeforeUpscaling = " << boolToString(renderReShadeBeforeUpscaling) << std::endl;
+    file << "mUpscaleDepthForReShade = " << boolToString(upscaleDepthForReShade) << std::endl;
+    file << "mUseTAAForPeriphery = " << boolToString(useTAAForPeriphery) << std::endl;
+    // Early DLSS integration flags (UI-guarded)
+    file << "mEarlyDlssEnabled = " << boolToString(earlyDlssEnabled) << std::endl;
+    file << "mEarlyDlssMode = " << earlyDlssMode << std::endl;
+    file << "mPeripheryTAAEnabled = " << boolToString(peripheryTAAEnabled) << std::endl;
+    file << "mFoveatedRenderingEnabled = " << boolToString(foveatedRenderingEnabled) << std::endl;
+    file << "mDebugEarlyDlss = " << boolToString(debugEarlyDlss) << std::endl;
+    file << "; Asiri per-eye boyutlarini onlemek icin guardrail" << std::endl;
+    file << "mEnablePerEyeCap = " << boolToString(enablePerEyeCap) << std::endl;
+    file << "mPerEyeMaxDim = " << perEyeMaxDim << std::endl;
+    file << "; Kucuk->buyuk kompozitte HQ yolunu kullan (varsayilan: false)" << std::endl;
+    file << "mHighQualityComposite = " << boolToString(highQualityComposite) << std::endl;
+    file << "mDLSSPreset = " << dlssPreset << std::endl;
+    file << "mFOV = " << fov << std::endl << std::endl;
+    file << "; ImGui menusu icin UI olcegi (0.5 - 3.0). VR icin 1.5 uygun" << std::endl;
+    file << "mUIScale = " << uiScale << std::endl << std::endl;
 
     file << "[DLSS4]" << std::endl;
-    file << "EnableTransformerModel = " << boolToString(enableTransformerModel) << std::endl;
-    file << "EnableRayReconstruction = " << boolToString(enableRayReconstruction) << std::endl << std::endl;
+    file << "mEnableTransformerModel = " << boolToString(enableTransformerModel) << std::endl;
+    file << "mEnableRayReconstruction = " << boolToString(enableRayReconstruction) << std::endl << std::endl;
 
     file << "[FixedFoveatedUpscaling]" << std::endl;
-    file << "EnableFixedFoveatedUpscaling = " << boolToString(enableFixedFoveatedUpscaling) << std::endl;
-    file << "FoveatedScaleX = " << foveatedScaleX << std::endl;
-    file << "FoveatedScaleY = " << foveatedScaleY << std::endl;
-    file << "FoveatedOffsetX = " << foveatedOffsetX << std::endl;
-    file << "FoveatedOffsetY = " << foveatedOffsetY << std::endl << std::endl;
+    file << "mEnableFixedFoveatedUpscaling = " << boolToString(enableFixedFoveatedUpscaling) << std::endl;
+    file << "mFoveatedScaleX = " << foveatedScaleX << std::endl;
+    file << "mFoveatedScaleY = " << foveatedScaleY << std::endl;
+    file << "mFoveatedOffsetX = " << foveatedOffsetX << std::endl;
+    file << "mFoveatedOffsetY = " << foveatedOffsetY << std::endl << std::endl;
 
     file << "[FixedFoveatedRendering]" << std::endl;
-    file << "EnableFixedFoveatedRendering = " << boolToString(enableFixedFoveatedRendering) << std::endl;
-    file << "InnerRadius = " << foveatedInnerRadius << std::endl;
-    file << "MiddleRadius = " << foveatedMiddleRadius << std::endl;
-    file << "OuterRadius = " << foveatedOuterRadius << std::endl;
-    file << "CutoutRadius = " << foveatedCutoutRadius << std::endl;
-    file << "Widen = " << foveatedWiden << std::endl << std::endl;
+    file << "mEnableFixedFoveatedRendering = " << boolToString(enableFixedFoveatedRendering) << std::endl;
+    file << "mInnerRadius = " << foveatedInnerRadius << std::endl;
+    file << "mMiddleRadius = " << foveatedMiddleRadius << std::endl;
+    file << "mOuterRadius = " << foveatedOuterRadius << std::endl;
+    file << "mCutoutRadius = " << foveatedCutoutRadius << std::endl;
+    file << "mWiden = " << foveatedWiden << std::endl << std::endl;
 
     file << "[Performance]" << std::endl;
-    file << "EnableLowLatencyMode = " << boolToString(enableLowLatencyMode) << std::endl;
-    file << "EnableReflex = " << boolToString(enableReflex) << std::endl << std::endl;
+    file << "mEnableLowLatencyMode = " << boolToString(enableLowLatencyMode) << std::endl;
+    file << "mEnableReflex = " << boolToString(enableReflex) << std::endl << std::endl;
 
     file << "[Hotkeys]" << std::endl;
     file << "; Virtual-key codes. See: https://learn.microsoft.com/windows/win32/inputdev/virtual-key-codes" << std::endl;
-    file << "ToggleMenu = " << FormatVirtualKey(toggleMenuKey) << std::endl;
-    file << "ToggleUpscaler = " << FormatVirtualKey(toggleUpscalerKey) << std::endl;
-    file << "CycleQuality = " << FormatVirtualKey(cycleQualityKey) << std::endl;
-    file << "CycleUpscaler = " << FormatVirtualKey(cycleUpscalerKey) << std::endl;
+    file << "mToggleMenu = " << FormatVirtualKey(toggleMenuKey) << std::endl;
+    file << "mToggleUpscaler = " << FormatVirtualKey(toggleUpscalerKey) << std::endl;
+    file << "mCycleQuality = " << FormatVirtualKey(cycleQualityKey) << std::endl;
+    file << "mCycleUpscaler = " << FormatVirtualKey(cycleUpscalerKey) << std::endl;
 
     file.close();
     _MESSAGE("Config saved to: %s", configPath.c_str());

@@ -79,6 +79,11 @@ public:
     bool foveatedRenderingEnabled = false; // FFR/FFU ana bayrak
     bool debugEarlyDlss = false;         // Geniş log
 
+    // Guardrails / IQ options
+    bool enablePerEyeCap = false;        // Optional cap to protect against extreme SS
+    int  perEyeMaxDim = 4096;            // Max per-eye dimension when cap is enabled
+    bool highQualityComposite = false;   // Use HQ composite path for small->big (optional)
+
 private:
     void ParseIniFile(const std::string& path);
 };

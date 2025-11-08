@@ -1,0 +1,145 @@
+========================================
+F4SEVR DLSS4 - Visual Studio 2022 Build
+========================================
+
+**********************************************************************
+** Visual Studio 2022 Developer Command Prompt v17.14.13
+** Copyright (c) 2025 Microsoft Corporation
+**********************************************************************
+[vcvarsall.bat] Environment initialized for: 'x64'
+Environment configured for x64
+
+Using NGX_SDK_PATH=C:\Users\user\Documents\m4rmz4Fo4\F4SEVR_DLSS_Plugin\DLSS-310.4.0
+Using SL_SDK_PATH=C:\Users\user\Documents\m4rmz4Fo4\F4SEVR_DLSS_Plugin\streamline-sdk-v2.9.0
+Final INCLUDE_SWITCHES: /I""src"" /I""include"" /I""common"" /I""third_party\imgui"" /I""third_party\imgui\backends"" /I""."" /I""C:\Users\user\Documents\m4rmz4Fo4\F4SEVR_DLSS_Plugin\DLSS-310.4.0\include"" /I""C:\Users\user\Documents\m4rmz4Fo4\F4SEVR_DLSS_Plugin\streamline-sdk-v2.9.0\include""
+Compiling source files...
+x64 için Microsoft (R) C/C++ İyileştirmeli Derleyicisi Sürüm 19.44.35215
+Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+
+main.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\xutility(4813): warning C4244: '=': 'wchar_t' - 'char' dönüşümü; veri kaybı olabilir
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\xutility(4813): note: şablon örneği oluşturma bağlamı (önce en eski olan)
+src\main.cpp(97): note: derlenen şablon işlevi 'std::basic_string<char,std::char_traits<char>,std::allocator<char>>::basic_string<std::_String_iterator<std::_String_val<std::_Simple_types<_Elem>>>,0>(_Iter,_Iter,const _Alloc &)' örneği oluşturma başvurusuna bakın
+        with
+        [
+            _Elem=wchar_t,
+            _Iter=std::_String_iterator<std::_String_val<std::_Simple_types<wchar_t>>>,
+            _Alloc=std::allocator<char>
+        ]
+src\main.cpp(97): note: 'DetectExternalOverlays::<lambda_67889d1fafeed1fe40f95e94fe3527ac>::operator ()' içinde ilk 'std::basic_string<char,std::char_traits<char>,std::allocator<char>>::basic_string' başvurusuna bakın
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\xstring(812): note: derlenen şablon işlevi 'void std::basic_string<char,std::char_traits<char>,std::allocator<char>>::_Construct_from_iter<wchar_t*,wchar_t*,_Size_type>(_Iter,const _Sent,_Size)' örneği oluşturma başvurusuna bakın
+        with
+        [
+            _Size_type=unsigned __int64,
+            _Iter=wchar_t *,
+            _Sent=wchar_t *,
+            _Size=unsigned __int64
+        ]
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\xstring(968): note: derlenen şablon işlevi '_OutIt *std::_Copy_n_unchecked4<wchar_t*,_Size,char*>(_InIt,_SizeTy,_OutIt)' örneği oluşturma başvurusuna bakın
+        with
+        [
+            _OutIt=char *,
+            _Size=unsigned __int64,
+            _InIt=wchar_t *,
+            _SizeTy=unsigned __int64
+        ]
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\xutility(4813): warning C4244: '=': 'const wchar_t' - 'char' dönüşümü; veri kaybı olabilir
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\xutility(4813): note: şablon örneği oluşturma bağlamı (önce en eski olan)
+src\main.cpp(198): note: derlenen şablon işlevi 'std::basic_string<char,std::char_traits<char>,std::allocator<char>>::basic_string<std::_String_const_iterator<std::_String_val<std::_Simple_types<_Elem>>>,0>(_Iter,_Iter,const _Alloc &)' örneği oluşturma başvurusuna bakın
+        with
+        [
+            _Elem=wchar_t,
+            _Iter=std::_String_const_iterator<std::_String_val<std::_Simple_types<wchar_t>>>,
+            _Alloc=std::allocator<char>
+        ]
+src\main.cpp(198): note: 'VerifyDLSSRuntimePresent' içinde ilk 'std::basic_string<char,std::char_traits<char>,std::allocator<char>>::basic_string' başvurusuna bakın
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\xstring(812): note: derlenen şablon işlevi 'void std::basic_string<char,std::char_traits<char>,std::allocator<char>>::_Construct_from_iter<const wchar_t*,const wchar_t*,_Size_type>(_Iter,const _Sent,_Size)' örneği oluşturma başvurusuna bakın
+        with
+        [
+            _Size_type=unsigned __int64,
+            _Iter=const wchar_t *,
+            _Sent=const wchar_t *,
+            _Size=unsigned __int64
+        ]
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\xstring(968): note: derlenen şablon işlevi '_OutIt *std::_Copy_n_unchecked4<const wchar_t*,_Size,char*>(_InIt,_SizeTy,_OutIt)' örneği oluşturma başvurusuna bakın
+        with
+        [
+            _OutIt=char *,
+            _Size=unsigned __int64,
+            _InIt=const wchar_t *,
+            _SizeTy=unsigned __int64
+        ]
+x64 için Microsoft (R) C/C++ İyileştirmeli Derleyicisi Sürüm 19.44.35215
+Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+
+F4SEVR_Upscaler.cpp
+x64 için Microsoft (R) C/C++ İyileştirmeli Derleyicisi Sürüm 19.44.35215
+Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+
+ImGui_Menu.cpp
+x64 için Microsoft (R) C/C++ İyileştirmeli Derleyicisi Sürüm 19.44.35215
+Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+
+dlss_config.cpp
+x64 için Microsoft (R) C/C++ İyileştirmeli Derleyicisi Sürüm 19.44.35215
+Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+
+dlss_hooks.cpp
+x64 için Microsoft (R) C/C++ İyileştirmeli Derleyicisi Sürüm 19.44.35215
+Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+
+dlss_manager.cpp
+x64 için Microsoft (R) C/C++ İyileştirmeli Derleyicisi Sürüm 19.44.35215
+Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+
+SLBackend.cpp
+x64 için Microsoft (R) C/C++ İyileştirmeli Derleyicisi Sürüm 19.44.35215
+Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+
+imgui.cpp
+x64 için Microsoft (R) C/C++ İyileştirmeli Derleyicisi Sürüm 19.44.35215
+Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+
+imgui_draw.cpp
+x64 için Microsoft (R) C/C++ İyileştirmeli Derleyicisi Sürüm 19.44.35215
+Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+
+imgui_tables.cpp
+x64 için Microsoft (R) C/C++ İyileştirmeli Derleyicisi Sürüm 19.44.35215
+Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+
+imgui_widgets.cpp
+x64 için Microsoft (R) C/C++ İyileştirmeli Derleyicisi Sürüm 19.44.35215
+Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+
+imgui_demo.cpp
+x64 için Microsoft (R) C/C++ İyileştirmeli Derleyicisi Sürüm 19.44.35215
+Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+
+imgui_impl_dx11.cpp
+x64 için Microsoft (R) C/C++ İyileştirmeli Derleyicisi Sürüm 19.44.35215
+Telif Hakkı (C) Microsoft Corporation. Tüm hakları saklıdır.
+
+imgui_impl_win32.cpp
+
+Linking F4SEVR_DLSS.dll...
+SL link flags: /LIBPATH:"C:\Users\user\Documents\m4rmz4Fo4\F4SEVR_DLSS_Plugin\streamline-sdk-v2.9.0\lib\x64"  C:\Users\user\Documents\m4rmz4Fo4\F4SEVR_DLSS_Plugin\streamline-sdk-v2.9.0\lib\x64\sl.interposer.lib
+[INFO] Linking NGX stub (dynamic CRT) from C:\Users\user\Documents\m4rmz4Fo4\F4SEVR_DLSS_Plugin\DLSS-310.4.0\lib\Windows_x86_64\x64\nvsdk_ngx_d.lib
+Microsoft (R) Incremental Linker Version 14.44.35215.0
+Copyright (C) Microsoft Corporation.  All rights reserved.
+
+   build\F4SEVR_DLSS.lib kitaplığı ve build\F4SEVR_DLSS.exp nesnesi oluşturuluyor
+
+========================================
+Build Successful
+Output: build\F4SEVR_DLSS.dll
+========================================
+
+Copying INI alongside the DLL...
+
+Packaging complete. See: dist
+
+To install:
+1. Copy F4SEVR_DLSS.dll to "Fallout 4 VR\Data\F4SE\Plugins\"
+2. Copy F4SEVR_DLSS.ini to "Fallout 4 VR\Data\F4SE\Plugins\"
+

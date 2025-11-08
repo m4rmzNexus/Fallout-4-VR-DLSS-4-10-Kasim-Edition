@@ -109,7 +109,16 @@ private:
     void ReleaseZeroDepthTexture();
     void ReleaseEyeRender(EyeContext& eye);
     bool EnsureDownscaleShaders();
-    bool DownscaleToRender(EyeContext& eye, ID3D11Texture2D* inputTexture, uint32_t renderWidth, uint32_t renderHeight);
+    // Downscale/crop inputTexture into eye.renderColor at renderWidth/renderHeight.
+    // UV window selects a sub-rectangle of the source: uv = offset + uv * scale.
+    bool DownscaleToRender(EyeContext& eye,
+                           ID3D11Texture2D* inputTexture,
+                           uint32_t renderWidth,
+                           uint32_t renderHeight,
+                           float uvOffsetX,
+                           float uvOffsetY,
+                           float uvScaleX,
+                           float uvScaleY);
 
     EyeContext m_leftEye;
     EyeContext m_rightEye;
@@ -148,6 +157,7 @@ private:
     ID3D11VertexShader* m_fsVS = nullptr;
     ID3D11PixelShader* m_fsPS = nullptr;
     ID3D11SamplerState* m_linearSampler = nullptr;
+    ID3D11Buffer* m_fsCB = nullptr;
 
     // Extended configuration state
     bool m_sharpeningEnabled = true;

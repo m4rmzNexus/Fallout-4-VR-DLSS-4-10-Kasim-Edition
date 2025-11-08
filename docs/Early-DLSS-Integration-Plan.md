@@ -157,4 +157,15 @@ Not: İlk kazanım için Faz 1 (viewport clamp) güvenlidir; daha büyük kazan�
 - [x] Log: OpenVR RecommendedRenderTargetSize per-eye alınıp düşük frekansta debug satırları (davranış değişimi yok).
 - [x] Yardımcı: DLSSManager::ComputeRenderSizeForOutput(out→render) eklendi.
 - [x] Faz 1: RSSetViewports/OMSetRenderTargets hook'ları (viewport clamp) ve DebugEarlyDlss logları (konservatif clamp; flag‑gated).
-- [x] Faz 2 (zemin): CreateTexture2D/OMSetRenderTargets ile RT redirect — ilk sahne RTV bind’ında küçük RT’ye yönlendirme, cache ve loglar (flag‑gated).
+- [x] Faz 2 (zemin): CreateTexture2D/OMSetRenderTargets ile RT redirect - ilk sahne RTV bind'ında küçük RT'ye yönlendirme, cache ve loglar (flag-gated).
+    
+### DEV‑v2 Additions
+- [x] Context coverage: Hook CreateDeferredContext so RSSetViewports/OMSetRenderTargets clamps apply to deferred contexts too.
+- [x] Per-eye sizing: Prefer IVRSystem::GetRecommendedRenderTargetSize; fallback detects SxS/top-bottom atlases (never treat full atlas as per‑eye). Optional cap to limit per‑eye max dimension (EnablePerEyeCap, PerEyeMaxDim).
+- [x] Guardrails/logs: Throttled “[EarlyDLSS][CLAMP] skip: …” reasons when clamp is not applied.
+- [/] Optional IQ path: HighQualityComposite flag is wired (currently falls back to linear blit). Default remains linear.
+
+### Config precedence note
+- The plugin first tries the Documents path: `C:\Users\<user>\Documents\My Games\Fallout4VR\F4SE\Plugins\F4SEVR_DLSS.ini`.
+- If missing, it falls back to the plugin directory INI; Save() always writes to the Documents path.
+- Ensure Balanced is set with `QualityLevel = 1` in the Documents INI for testing.
