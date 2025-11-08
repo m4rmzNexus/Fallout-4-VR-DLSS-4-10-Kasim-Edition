@@ -156,5 +156,5 @@ Not: İlk kazanım için Faz 1 (viewport clamp) güvenlidir; daha büyük kazan�
 - [x] UI: ImGui menüsünde "Early DLSS (Experimental)" bölümü (toggle, mod, debug).
 - [x] Log: OpenVR RecommendedRenderTargetSize per-eye alınıp düşük frekansta debug satırları (davranış değişimi yok).
 - [x] Yardımcı: DLSSManager::ComputeRenderSizeForOutput(out→render) eklendi.
-- [ ] Faz 1: RSSetViewports/OMSetRenderTargets hook'ları (viewport clamp) ve DebugEarlyDlss logları.
-- [ ] Faz 2: CreateTexture2D/OMSetRenderTargets ile RT redirect (guarded by EarlyDlssMode==rt_redirect).
+- [x] Faz 1: RSSetViewports/OMSetRenderTargets hook'ları (viewport clamp) ve DebugEarlyDlss logları (konservatif clamp; flag‑gated).
+- [x] Faz 2 (zemin): CreateTexture2D/OMSetRenderTargets ile RT redirect — ilk sahne RTV bind’ında küçük RT’ye yönlendirme, cache ve loglar (flag‑gated).
