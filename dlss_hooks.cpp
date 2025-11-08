@@ -18,6 +18,8 @@
 #include <limits>
 #include <cmath>
 #include <vector>
+#include <unordered_map>
+#include <mutex>
 
 extern DLSSManager* g_dlssManager;
 extern DLSSConfig* g_dlssConfig;
@@ -92,6 +94,16 @@ namespace {
     std::atomic<bool> g_sceneActive{false};
     D3D11_TEXTURE2D_DESC g_sceneRTDesc{};
     int g_clampLogBudgetPerFrame = 4;
+    // Phase 2 (RT redirect) state and cache
+    std::atomic<bool> g_redirectUsedThisFrame{false};
+    struct RedirectEntry {
+        ID3D11Texture2D* smallTex = nullptr;
+        ID3D11RenderTargetView* smallRTV = nullptr;
+        UINT smallW = 0, smallH = 0;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    };
+    static std::unordered_map<ID3D11Texture2D*, RedirectEntry> g_redirectMap;
+    static std::mutex g_redirectMutex;
 
 
     void SafeAssignTexture(ID3D11Texture2D*& target, ID3D11Texture2D* source) {
@@ -265,6 +277,7 @@ HRESULT WINAPI HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT
         g_sceneActive.store(false, std::memory_order_relaxed);
         g_sceneRTDesc = {};
         g_clampLogBudgetPerFrame = 4;
+        g_redirectUsedThisFrame.store(false, std::memory_order_relaxed);
         if (g_pendingResizeHook && pSwapChain && !g_resizeHookInstalled) {
             if (InstallResizeHook(pSwapChain)) {
                 _MESSAGE("Deferred IDXGISwapChain::ResizeBuffers hook installed");
@@ -728,26 +741,23 @@ namespace {
     void TryHookDevice(ID3D11Device* device) {
         if (!device) {
             return;
-            
-        // Hook the immediate context for viewport clamp
-        ID3D11DeviceContext* ctx = nullptr;
-        device->GetImmediateContext(&ctx);
-        if (ctx) {
-            // ID3D11DeviceContext vtable indices (common): OMSetRenderTargets ~33, RSSetViewports ~44
-            HookVTableFunction(ctx, 33, DLSSHooks::HookedOMSetRenderTargets, &DLSSHooks::RealOMSetRenderTargets) | Out-Null;
-            HookVTableFunction(ctx, 44, DLSSHooks::HookedRSSetViewports, &DLSSHooks::RealRSSetViewports) | Out-Null;
-            ctx->Release();
         }
-    }
-
         if (g_hookedDevice == device && g_deviceHookInstalled) {
             return;
         }
-
         if (HookVTableFunction(device, 5, DLSSHooks::HookedCreateTexture2D, &DLSSHooks::RealCreateTexture2D)) {
             g_hookedDevice = device;
             g_deviceHookInstalled = true;
             _MESSAGE("ID3D11Device::CreateTexture2D hook installed");
+            // Hook the immediate context for viewport clamp and RT redirect
+            ID3D11DeviceContext* ctx = nullptr;
+            device->GetImmediateContext(&ctx);
+            if (ctx) {
+                HookVTableFunction(ctx, 33, DLSSHooks::HookedOMSetRenderTargets, &DLSSHooks::RealOMSetRenderTargets);
+                HookVTableFunction(ctx, 44, DLSSHooks::HookedRSSetViewports, &DLSSHooks::RealRSSetViewports);
+                _MESSAGE("Immediate context hooks installed (OMSetRenderTargets, RSSetViewports)");
+                ctx->Release();
+            }
         } else {
             g_deviceHookInstalled = false;
             _ERROR("Failed to hook ID3D11Device::CreateTexture2D");
@@ -1197,24 +1207,58 @@ namespace DLSSHooks {
     }
 
     void STDMETHODCALLTYPE HookedOMSetRenderTargets(ID3D11DeviceContext* ctx, UINT numRTVs, ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV) {
-        if (RealOMSetRenderTargets) {
-            RealOMSetRenderTargets(ctx, numRTVs, ppRTVs, pDSV);
-        }
-        if (!g_dlssConfig || !g_dlssConfig->earlyDlssEnabled) {
-            return;
-        }
         if (!ppRTVs || numRTVs == 0 || !ppRTVs[0]) {
+            if (RealOMSetRenderTargets) RealOMSetRenderTargets(ctx, numRTVs, ppRTVs, pDSV);
             return;
         }
+        // Detect scene begin on any mode
         D3D11_TEXTURE2D_DESC d{};
         if (GetDescFromRTV(ppRTVs[0], &d)) {
             if (IsSceneColorRTDesc(d)) {
                 g_sceneRTDesc = d;
                 g_sceneActive.store(true, std::memory_order_relaxed);
-                if (g_dlssConfig->debugEarlyDlss) {
+                if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
                     _MESSAGE("[EarlyDLSS][SceneBegin] RTV=%ux%u fmt=%u", d.Width, d.Height, (unsigned)d.Format);
                 }
             }
+        }
+
+        // Redirect only when enabled and mode == rt_redirect (1) and only once per frame
+        bool didRedirect = false;
+        if (g_dlssConfig && g_dlssConfig->earlyDlssEnabled && g_dlssConfig->earlyDlssMode == 1 && !g_redirectUsedThisFrame.load(std::memory_order_relaxed)) {
+            if (IsSceneColorRTDesc(g_sceneRTDesc)) {
+                // Compute target output and predicted render size
+                uint32_t outLw=0, outLh=0, outRw=0, outRh=0;
+                (void)DLSSHooks::GetPerEyeDisplaySize(0, outLw, outLh);
+                (void)DLSSHooks::GetPerEyeDisplaySize(1, outRw, outRh);
+                uint32_t tgtOutW = outLw ? outLw : outRw;
+                uint32_t tgtOutH = outLh ? outLh : outRh;
+                if (tgtOutW == 0 || tgtOutH == 0) { tgtOutW = g_sceneRTDesc.Width; tgtOutH = g_sceneRTDesc.Height; }
+                uint32_t prW=0, prH=0;
+                if (g_dlssManager && g_dlssManager->ComputeRenderSizeForOutput(tgtOutW, tgtOutH, prW, prH)) {
+                    if (prW > 0 && prH > 0 && (prW < g_sceneRTDesc.Width || prH < g_sceneRTDesc.Height)) {
+                        ID3D11RenderTargetView* smallRTV = GetOrCreateSmallRTVFor(ppRTVs[0], prW, prH);
+                        if (smallRTV) {
+                            // Build a local array replacing RTV[0]
+                            std::vector<ID3D11RenderTargetView*> rtvs(numRTVs);
+                            for (UINT i=0;i<numRTVs;++i) rtvs[i] = ppRTVs[i];
+                            rtvs[0] = smallRTV;
+                            if (g_dlssConfig->debugEarlyDlss) {
+                                _MESSAGE("[EarlyDLSS][Redirect] RTV old=%ux%u -> small=%ux%u", g_sceneRTDesc.Width, g_sceneRTDesc.Height, prW, prH);
+                            }
+                            if (RealOMSetRenderTargets) RealOMSetRenderTargets(ctx, numRTVs, rtvs.data(), pDSV);
+                            didRedirect = true;
+                            g_redirectUsedThisFrame.store(true, std::memory_order_relaxed);
+                            // Do not call Real again below
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!didRedirect) {
+            if (RealOMSetRenderTargets) RealOMSetRenderTargets(ctx, numRTVs, ppRTVs, pDSV);
         }
     }
 
@@ -1277,4 +1321,48 @@ namespace DLSSHooks {
         }
         (void)anyClamped;
     }
+}
+
+static ID3D11RenderTargetView* GetOrCreateSmallRTVFor(ID3D11RenderTargetView* bigRTV, UINT prW, UINT prH) {
+    if (!bigRTV || !g_device) return nullptr;
+    ID3D11Resource* res = nullptr;
+    bigRTV->GetResource(&res);
+    if (!res) return nullptr;
+    ID3D11Texture2D* bigTex = nullptr;
+    HRESULT hr = res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&bigTex);
+    res->Release();
+    if (FAILED(hr) || !bigTex) return nullptr;
+
+    D3D11_TEXTURE2D_DESC d{};
+    bigTex->GetDesc(&d);
+    std::lock_guard<std::mutex> lock(g_redirectMutex);
+    RedirectEntry& e = g_redirectMap[bigTex];
+    // If no entry or mismatched size/format, (re)create
+    if (!e.smallTex || e.smallW != prW || e.smallH != prH || e.format != d.Format) {
+        if (e.smallRTV) { e.smallRTV->Release(); e.smallRTV = nullptr; }
+        if (e.smallTex) { e.smallTex->Release(); e.smallTex = nullptr; }
+        D3D11_TEXTURE2D_DESC td = d;
+        td.Width = prW; td.Height = prH; td.MipLevels = 1; td.ArraySize = 1;
+        td.SampleDesc.Count = 1;
+        td.BindFlags |= D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        td.BindFlags &= ~(D3D11_BIND_DEPTH_STENCIL);
+        td.MiscFlags &= ~(D3D11_RESOURCE_MISC_SHARED);
+        if (FAILED(g_device->CreateTexture2D(&td, nullptr, &e.smallTex))) {
+            bigTex->Release();
+            g_redirectMap.erase(bigTex);
+            return nullptr;
+        }
+        if (FAILED(g_device->CreateRenderTargetView(e.smallTex, nullptr, &e.smallRTV))) {
+            e.smallTex->Release(); e.smallTex = nullptr;
+            bigTex->Release();
+            g_redirectMap.erase(bigTex);
+            return nullptr;
+        }
+        e.smallW = prW; e.smallH = prH; e.format = d.Format;
+        if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
+            _MESSAGE("[EarlyDLSS][RT] Created small RT %ux%u for fmt=%u", prW, prH, (unsigned)d.Format);
+        }
+    }
+    bigTex->Release();
+    return e.smallRTV;
 }
