@@ -24,9 +24,16 @@ namespace {
     std::wstring GetDocumentsSLPath() {
         wchar_t docs[MAX_PATH] = {};
         if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_MYDOCUMENTS, NULL, 0, docs))) {
-            std::wstring path = std::wstring(docs) + L"\\My Games\\Fallout4VR\\F4SE\\Plugins\\SL\\";
-            SHCreateDirectoryExW(NULL, path.c_str(), NULL);
-            return path;
+            std::wstring base = std::wstring(docs) + L"\\My Games\\";
+            std::wstring dirNoSpace = base + L"Fallout4VR\\F4SE\\Plugins\\SL\\";
+            std::wstring dirWithSpace = base + L"Fallout 4 VR\\F4SE\\Plugins\\SL\\";
+            // Prefer an existing folder if present; else create the no-space variant
+            DWORD a = GetFileAttributesW(dirNoSpace.c_str());
+            DWORD b = GetFileAttributesW(dirWithSpace.c_str());
+            std::wstring chosen = (a != INVALID_FILE_ATTRIBUTES) ? dirNoSpace :
+                                   (b != INVALID_FILE_ATTRIBUTES) ? dirWithSpace : dirNoSpace;
+            SHCreateDirectoryExW(NULL, chosen.c_str(), NULL);
+            return chosen;
         }
         return L".\\SL\\";
     }
@@ -477,6 +484,7 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
 
     (void)slSetConstants(consts, *m_frameToken, viewport);
     (void)slDLSSSetOptions(viewport, m_options);
+    _MESSAGE("[SL] Options: mode=%u sharp=%.2f", (unsigned)m_options.mode, m_options.sharpness);
 
     _MESSAGE("[SL] ProcessEye: eye=%d", eyeIndex);
     _MESSAGE("[SL] Evaluate: in=%ux%u(outTex=%ux%u) out=%ux%u(outTex=%ux%u) depth=%d mv=%d",

@@ -100,6 +100,8 @@ namespace {
     bool g_compositedThisFrame = false;
     // Phase 2 (RT redirect) state and cache
     std::atomic<bool> g_redirectUsedThisFrame{false};
+    // Reentrancy guard to avoid recursion while we composite small->big
+    static std::atomic<bool> g_inComposite{ false };
     struct RedirectEntry {
         ID3D11Texture2D* smallTex = nullptr;
         ID3D11RenderTargetView* smallRTV = nullptr;
@@ -1359,28 +1361,105 @@ namespace DLSSHooks {
         return true;
     }
 
+    static bool ApproxEqUINT(UINT a, UINT b, float relTol = 0.1f) {
+        if (a == b) return true;
+        float fa = static_cast<float>(a), fb = static_cast<float>(b);
+        float diff = fabsf(fa - fb);
+        float tol = std::max(2.0f, fb * relTol);
+        return diff <= tol;
+    }
+
+    // More strict heuristic to identify VR eye scene RTs and avoid clamping mirror swapchain
+    static bool IsLikelyVRSceneRT(const D3D11_TEXTURE2D_DESC& d) {
+        // Exclude tiny/utility
+        if (!IsSceneColorRTDesc(d)) return false;
+
+        // Exclude mirror backbuffer if we can resolve swapchain size
+        UINT sw = 0, sh = 0; bool haveSwap = GetSwapChainSize(sw, sh);
+        if (haveSwap && d.Width == sw && d.Height == sh) {
+            return false;
+        }
+
+        // Prefer OpenVR-derived per-eye sizes when available
+        uint32_t eyeW = 0, eyeH = 0;
+        bool gotL = DLSSHooks::GetPerEyeDisplaySize(0, eyeW, eyeH);
+        if (!gotL) {
+            (void)DLSSHooks::GetPerEyeDisplaySize(1, eyeW, eyeH);
+        }
+        if (eyeW > 0 && eyeH > 0) {
+            // Accept single-eye RT (≈ eyeW x eyeH) or SxS atlas (≈ 2*eyeW x eyeH)
+            if ((ApproxEqUINT(d.Width, eyeW) && ApproxEqUINT(d.Height, eyeH)) ||
+                (ApproxEqUINT(d.Width, eyeW * 2u) && ApproxEqUINT(d.Height, eyeH))) {
+                return true;
+            }
+            // Also accept DLSS render-size candidates (e.g., 1344x1488 per eye, 2688x1488 combined)
+            uint32_t prW = 0, prH = 0;
+            if (g_dlssManager && g_dlssManager->ComputeRenderSizeForOutput(eyeW, eyeH, prW, prH)) {
+                if ((ApproxEqUINT(d.Width, prW) && ApproxEqUINT(d.Height, prH)) ||
+                    (ApproxEqUINT(d.Width, prW * 2u) && ApproxEqUINT(d.Height, prH))) {
+                    return true;
+                }
+            }
+        }
+
+        // Fallback: accept very wide SxS-like atlases (width >= 1.7*height) with large dimensions
+        if (d.Width >= (UINT)(d.Height * 1.7f) && d.Width >= 2500 && d.Height >= 1200) {
+            return true;
+        }
+
+        // Also accept tall-ish single-eye frames typical for VR (e.g., ~2016x2232)
+        if (d.Height >= 2000 && d.Width >= 1500) {
+            return true;
+        }
+
+        return false;
+    }
+
     void STDMETHODCALLTYPE HookedOMSetRenderTargets(ID3D11DeviceContext* ctx, UINT numRTVs, ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV) {
         // Composite small->big if a post/HUD big RT is bound after redirect
-        if (ppRTVs && numRTVs > 0 && ppRTVs[0]) { CompositeIfNeededOnBigBind(ppRTVs[0]); }
+        // but never re-enter while we are inside the composite blit itself
+        if (!g_inComposite.load(std::memory_order_relaxed) && ppRTVs && numRTVs > 0 && ppRTVs[0]) {
+            CompositeIfNeededOnBigBind(ppRTVs[0]);
+        }
         if (!ppRTVs || numRTVs == 0 || !ppRTVs[0]) {
             if (RealOMSetRenderTargets) RealOMSetRenderTargets(ctx, numRTVs, ppRTVs, pDSV);
             return;
         }
-        // Detect scene begin on any mode
+        // Detect scene begin on any mode, but only flag VR eye scene RTs (avoid mirror backbuffer)
         D3D11_TEXTURE2D_DESC d{};
         if (GetDescFromRTV(ppRTVs[0], &d)) {
-            if (IsSceneColorRTDesc(d)) {
+            if (IsLikelyVRSceneRT(d)) {
                 g_sceneRTDesc = d;
                 g_sceneActive.store(true, std::memory_order_relaxed);
                 if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
                     _MESSAGE("[EarlyDLSS][SceneBegin] RTV=%ux%u fmt=%u", d.Width, d.Height, (unsigned)d.Format);
+                }
+            } else {
+                // If we detect the mirror swapchain backbuffer, explicitly end scene for clamp
+                UINT sw=0, sh=0; if (GetSwapChainSize(sw, sh) && d.Width==sw && d.Height==sh) {
+                    if (g_sceneActive.load(std::memory_order_relaxed)) {
+                        g_sceneActive.store(false, std::memory_order_relaxed);
+                        if (g_dlssConfig && g_dlssConfig->debugEarlyDlss && g_clampLogBudgetPerFrame > 0) {
+                            _MESSAGE("[EarlyDLSS][SceneEnd] Mirror backbuffer bound %ux%u — clamp disabled", d.Width, d.Height);
+                            --g_clampLogBudgetPerFrame;
+                        }
+                    }
                 }
             }
         }
 
         // Redirect only when enabled and mode == rt_redirect (1) and only once per frame
         bool didRedirect = false;
-        if (g_dlssConfig && g_dlssConfig->earlyDlssEnabled && g_dlssConfig->earlyDlssMode == 1 && !g_redirectUsedThisFrame.load(std::memory_order_relaxed)) {
+        if (!g_inComposite.load(std::memory_order_relaxed) &&
+            g_dlssConfig && g_dlssConfig->earlyDlssEnabled && g_dlssConfig->earlyDlssMode == 1 && !g_redirectUsedThisFrame.load(std::memory_order_relaxed)) {
+            // Only attempt redirect when the currently bound RTV also looks like the VR scene RT
+            D3D11_TEXTURE2D_DESC boundDesc{};
+            bool haveBound = GetDescFromRTV(ppRTVs[0], &boundDesc);
+            if (haveBound && !IsLikelyVRSceneRT(boundDesc)) {
+                // Skip redirect on mirror/backbuffer or unrelated passes
+                if (RealOMSetRenderTargets) RealOMSetRenderTargets(ctx, numRTVs, ppRTVs, pDSV);
+                return;
+            }
             if (IsSceneColorRTDesc(g_sceneRTDesc)) {
                 // Compute target output and predicted render size
                 uint32_t outLw=0, outLh=0, outRw=0, outRh=0;
@@ -1520,6 +1599,7 @@ static ID3D11RenderTargetView* GetOrCreateSmallRTVFor(ID3D11RenderTargetView* bi
         D3D11_TEXTURE2D_DESC td = d;
         td.Width = prW; td.Height = prH; td.MipLevels = 1; td.ArraySize = 1;
         td.SampleDesc.Count = 1;
+        td.SampleDesc.Quality = 0; // must be 0 when Count==1
         td.BindFlags |= D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         td.BindFlags &= ~(D3D11_BIND_DEPTH_STENCIL);
         td.MiscFlags &= ~(D3D11_RESOURCE_MISC_SHARED);
@@ -1547,6 +1627,7 @@ static ID3D11RenderTargetView* GetOrCreateSmallRTVFor(ID3D11RenderTargetView* bi
     static void CompositeIfNeededOnBigBind(ID3D11RenderTargetView* bigRTV) {
         if (!g_dlssConfig || !g_dlssConfig->earlyDlssEnabled) return;
         if (!g_redirectUsedThisFrame.load(std::memory_order_relaxed) || g_compositedThisFrame) return;
+        if (g_inComposite.load(std::memory_order_relaxed)) return; // avoid recursion
         if (!bigRTV) return;
         // Resolve big texture key
         ID3D11Resource* res=nullptr; bigRTV->GetResource(&res); if(!res) return; ID3D11Texture2D* bigTex=nullptr; if(FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D),(void**)&bigTex))){ res->Release(); return; } res->Release();
@@ -1560,6 +1641,8 @@ static ID3D11RenderTargetView* GetOrCreateSmallRTVFor(ID3D11RenderTargetView* bi
         }
         // Composite small->big; optional HQ path can be enabled via config
         if (g_dlssManager && entry.smallTex) {
+            g_inComposite.store(true, std::memory_order_relaxed);
+            // Ensure we clear the flag even if blit path bails out
             bool ok = false;
             if (g_dlssConfig && g_dlssConfig->highQualityComposite) {
                 // Placeholder: fall back to linear blit for now
@@ -1575,6 +1658,7 @@ static ID3D11RenderTargetView* GetOrCreateSmallRTVFor(ID3D11RenderTargetView* bi
                     _MESSAGE("[EarlyDLSS][Composite] small->big %ux%u", g_sceneRTDesc.Width, g_sceneRTDesc.Height);
                 }
             }
+            g_inComposite.store(false, std::memory_order_relaxed);
         }
         bigTex->Release();
     }

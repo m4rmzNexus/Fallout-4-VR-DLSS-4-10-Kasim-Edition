@@ -108,10 +108,16 @@ namespace {
         if (!SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_MYDOCUMENTS, NULL, 0, docs))) {
             return L".\\"; // fallback
         }
-        std::wstring path = std::wstring(docs) + L"\\My Games\\Fallout4VR\\F4SE\\Plugins\\NGX\\";
-        // ensure directory exists
-        SHCreateDirectoryExW(NULL, path.c_str(), NULL);
-        return path;
+        // Support both folder variants
+        std::wstring base = std::wstring(docs) + L"\\My Games\\";
+        std::wstring dirNoSpace = base + L"Fallout4VR\\F4SE\\Plugins\\NGX\\";
+        std::wstring dirWithSpace = base + L"Fallout 4 VR\\F4SE\\Plugins\\NGX\\";
+        DWORD a = GetFileAttributesW(dirNoSpace.c_str());
+        DWORD b = GetFileAttributesW(dirWithSpace.c_str());
+        std::wstring chosen = (a != INVALID_FILE_ATTRIBUTES) ? dirNoSpace :
+                               (b != INVALID_FILE_ATTRIBUTES) ? dirWithSpace : dirNoSpace;
+        SHCreateDirectoryExW(NULL, chosen.c_str(), NULL);
+        return chosen;
     }
 
     bool LoadNGXLibrary() {
@@ -257,7 +263,8 @@ void DLSSManager::SetSharpness(float sharpness) {
     m_sharpness = sharpness;
 #if USE_STREAMLINE
     if (m_backend) {
-        m_backend->SetSharpness(sharpness);
+        // Respect sharpening toggle for Streamline path as well
+        m_backend->SetSharpness(m_sharpeningEnabled ? sharpness : 0.0f);
     }
 #endif
 }
@@ -346,14 +353,12 @@ bool DLSSManager::InitializeNGX() {
         std::vector<const wchar_t*> pathPtrs;
         // Prefer plugin directory
         ownedPaths.push_back(GetPluginDirectory());
-        // Also add Documents plugins folder
-        ownedPaths.push_back(L"\\My Games\\Fallout4VR\\F4SE\\Plugins\\");
-        // Ensure absolute for the second entry if needed by prefixing Documents root
-        if (ownedPaths.back().front() == L'\\') {
-            wchar_t docs[MAX_PATH] = {};
-            if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_MYDOCUMENTS, NULL, 0, docs))) {
-                ownedPaths.back() = std::wstring(docs) + ownedPaths.back();
-            }
+        // Also add Documents plugins folders (both variants)
+        wchar_t docs[MAX_PATH] = {};
+        if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_MYDOCUMENTS, NULL, 0, docs))) {
+            std::wstring base = std::wstring(docs);
+            ownedPaths.push_back(base + L"\\My Games\\Fallout4VR\\F4SE\\Plugins\\");
+            ownedPaths.push_back(base + L"\\My Games\\Fallout 4 VR\\F4SE\\Plugins\\");
         }
         for (auto& w : ownedPaths) {
             if (!w.empty()) pathPtrs.push_back(w.c_str());
@@ -473,6 +478,12 @@ void DLSSManager::SetQuality(Quality quality) {
 
 void DLSSManager::SetSharpeningEnabled(bool enabled) {
     m_sharpeningEnabled = enabled;
+#if USE_STREAMLINE
+    if (m_backend) {
+        // Propagate current effective sharpness immediately
+        m_backend->SetSharpness(m_sharpeningEnabled ? m_sharpness : 0.0f);
+    }
+#endif
 }
 
 void DLSSManager::SetUseOptimalMipLodBias(bool enabled) {

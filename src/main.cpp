@@ -27,13 +27,20 @@ extern "C" bool InstallDLSSHooks();
 
 // Log function
 static std::string GetDocumentsLogPath() {
-    char path[MAX_PATH] = {0};
-    if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_MYDOCUMENTS, NULL, 0, path))) {
-        std::string p = path;
-        p += "\\My Games\\Fallout4VR\\F4SE\\Plugins\\F4SEVR_DLSS.log";
-        return p;
+    char docs[MAX_PATH] = {0};
+    if (!SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_MYDOCUMENTS, NULL, 0, docs))) {
+        return std::string("F4SEVR_DLSS.log");
     }
-    return std::string("F4SEVR_DLSS.log");
+    std::string base = docs;
+    const std::string pNoSpace = base + "\\My Games\\Fallout4VR\\F4SE\\Plugins\\F4SEVR_DLSS.log";
+    const std::string pWithSpace = base + "\\My Games\\Fallout 4 VR\\F4SE\\Plugins\\F4SEVR_DLSS.log";
+    if (GetFileAttributesA(pNoSpace.c_str()) != INVALID_FILE_ATTRIBUTES) return pNoSpace;
+    if (GetFileAttributesA(pWithSpace.c_str()) != INVALID_FILE_ATTRIBUTES) return pWithSpace;
+    const std::string dNo = base + "\\My Games\\Fallout4VR\\F4SE\\Plugins\\";
+    const std::string dWs = base + "\\My Games\\Fallout 4 VR\\F4SE\\Plugins\\";
+    if (GetFileAttributesA(dNo.c_str()) != INVALID_FILE_ATTRIBUTES) return pNoSpace;
+    if (GetFileAttributesA(dWs.c_str()) != INVALID_FILE_ATTRIBUTES) return pWithSpace;
+    return pNoSpace;
 }
 
 static void Log(const char* format, ...) {

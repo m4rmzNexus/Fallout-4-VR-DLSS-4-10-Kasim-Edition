@@ -91,13 +91,23 @@ DLSSConfig::~DLSSConfig() {
 }
 
 std::string DLSSConfig::GetDocumentsConfigPath() {
-    char path[MAX_PATH] = {};
-    if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_MYDOCUMENTS, NULL, 0, path))) {
-        std::string configPath = path;
-        configPath += "\\My Games\\Fallout4VR\\F4SE\\Plugins\\F4SEVR_DLSS.ini";
-        return configPath;
+    char docs[MAX_PATH] = {};
+    if (!SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_MYDOCUMENTS, NULL, 0, docs))) {
+        return std::string("F4SEVR_DLSS.ini");
     }
-    return std::string("F4SEVR_DLSS.ini");
+    // Support both folder variants used by different FO4VR installs
+    std::string base = docs;
+    const std::string pathNoSpace = base + "\\My Games\\Fallout4VR\\F4SE\\Plugins\\F4SEVR_DLSS.ini";
+    const std::string pathWithSpace = base + "\\My Games\\Fallout 4 VR\\F4SE\\Plugins\\F4SEVR_DLSS.ini";
+    // Prefer whichever already exists
+    if (GetFileAttributesA(pathNoSpace.c_str()) != INVALID_FILE_ATTRIBUTES) return pathNoSpace;
+    if (GetFileAttributesA(pathWithSpace.c_str()) != INVALID_FILE_ATTRIBUTES) return pathWithSpace;
+    // If neither INI exists yet, prefer the folder that exists; otherwise default to no‑space variant
+    const std::string dirNoSpace = base + "\\My Games\\Fallout4VR\\F4SE\\Plugins\\";
+    const std::string dirWithSpace = base + "\\My Games\\Fallout 4 VR\\F4SE\\Plugins\\";
+    if (GetFileAttributesA(dirNoSpace.c_str()) != INVALID_FILE_ATTRIBUTES) return pathNoSpace;
+    if (GetFileAttributesA(dirWithSpace.c_str()) != INVALID_FILE_ATTRIBUTES) return pathWithSpace;
+    return pathNoSpace;
 }
 
 namespace {
@@ -165,7 +175,31 @@ std::string DLSSConfig::GetConfigPath() {
 
 void DLSSConfig::Load() {
     bool isDocs = false, isPlugin = false;
-    std::string configPath = DLSSConfig::ResolveConfigPath(&isDocs, &isPlugin);
+    const std::string docsPath = DLSSConfig::GetDocumentsConfigPath();
+    const std::string pluginPath = DLSSConfig::GetPluginConfigPath();
+
+    const DWORD docsAttr = GetFileAttributesA(docsPath.c_str());
+    const DWORD plugAttr = GetFileAttributesA(pluginPath.c_str());
+
+    std::string configPath;
+    bool shouldPersistToDocs = false;
+
+    if (docsAttr != INVALID_FILE_ATTRIBUTES) {
+        // Normal case: prefer Documents
+        configPath = docsPath;
+        isDocs = true;
+    } else if (plugAttr != INVALID_FILE_ATTRIBUTES) {
+        // Documents missing but plugin INI present (e.g., fresh install via MO2)
+        // Load from plugin and then persist to Documents to unify the source of truth
+        configPath = pluginPath;
+        isPlugin = true;
+        shouldPersistToDocs = true;
+    } else {
+        // Neither exists yet; will create defaults in Documents on Parse failure
+        configPath = docsPath;
+        isDocs = true;
+    }
+
     if (isPlugin && !isDocs) {
         _MESSAGE("Loading config from plugin directory (legacy): %s", configPath.c_str());
     } else {
@@ -173,6 +207,11 @@ void DLSSConfig::Load() {
     }
 
     ParseIniFile(configPath);
+    if (shouldPersistToDocs) {
+        // Copy current in-memory settings to Documents to avoid future ambiguity
+        Save();
+        _MESSAGE("Config replicated to Documents path after plugin load");
+    }
     
     // Apply settings to DLSS Manager
     if (g_dlssManager) {
@@ -367,12 +406,14 @@ void DLSSConfig::ParseIniFile(const std::string& path) {
 void DLSSConfig::Save() {
     std::string configPath = DLSSConfig::GetDocumentsConfigPath();
 
+    // Ensure nested directories exist (F4SE\Plugins under Documents)
     std::string directory;
     const size_t delimiter = configPath.find_last_of("/\\");
     if (delimiter != std::string::npos) {
         directory = configPath.substr(0, delimiter);
         if (!directory.empty()) {
-            CreateDirectoryA(directory.c_str(), NULL);
+            // Create full tree (CreateDirectoryA creates only leaf)
+            SHCreateDirectoryExA(NULL, directory.c_str(), NULL);
         }
     }
 
