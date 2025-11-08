@@ -320,11 +320,21 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
     color.height = inDesc.Height;
     color.nativeFormat = static_cast<uint32_t>(inDesc.Format);
 
-    sl::Extent inExtent{ renderWidth, renderHeight };
-    sl::Extent outExtent{ outputWidth, outputHeight };
+    // Build extents as full-rects (left=0, top=0) and clamp to resource sizes
+    auto clampTo = [](uint32_t wantW, uint32_t wantH, uint32_t resW, uint32_t resH) -> sl::Extent {
+        sl::Extent e{};
+        e.left = 0; e.top = 0;
+        e.width = (wantW > resW) ? resW : wantW;
+        e.height = (wantH > resH) ? resH : wantH;
+        if (e.width == 0) e.width = resW; // fall back to full size if caller passed 0
+        if (e.height == 0) e.height = resH;
+        return e;
+    };
+
+    const sl::Extent inExtent = clampTo(renderWidth, renderHeight, inDesc.Width, inDesc.Height);
 
     sl::ResourceTag tags[5] = {
-        sl::ResourceTag(&color, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &inExtent)
+        sl::ResourceTag(&color, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow, &inExtent)
     };
     uint32_t numTags = 1;
 
@@ -335,7 +345,8 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
         depth.type = sl::ResourceType::eTex2d;
         depth.width = d.Width; depth.height = d.Height;
         depth.nativeFormat = static_cast<uint32_t>(ResolveDepthFormat(d.Format));
-        tags[numTags++] = sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate, &inExtent);
+        const sl::Extent dpExtent = clampTo(renderWidth, renderHeight, d.Width, d.Height);
+        tags[numTags++] = sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &dpExtent);
     }
 
     sl::Resource mv{};
@@ -344,7 +355,8 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
         mv.native = static_cast<void*>(static_cast<ID3D11Resource*>(inputMotionVectors));
         mv.type = sl::ResourceType::eTex2d;
         mv.width = m.Width; mv.height = m.Height; mv.nativeFormat = static_cast<uint32_t>(m.Format);
-        tags[numTags++] = sl::ResourceTag(&mv, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &inExtent);
+        const sl::Extent mvExtent = clampTo(renderWidth, renderHeight, m.Width, m.Height);
+        tags[numTags++] = sl::ResourceTag(&mv, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow, &mvExtent);
     }
 
     sl::Resource out{};
@@ -353,16 +365,47 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
         out.native = static_cast<void*>(static_cast<ID3D11Resource*>(outputTarget));
         out.type = sl::ResourceType::eTex2d;
         out.width = o.Width; out.height = o.Height; out.nativeFormat = static_cast<uint32_t>(o.Format);
-        tags[numTags++] = sl::ResourceTag(&out, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &outExtent);
+        const sl::Extent clampedOutExtent = clampTo(outputWidth, outputHeight, o.Width, o.Height);
+        tags[numTags++] = sl::ResourceTag(&out, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eOnlyValidNow, &clampedOutExtent);
     }
 
     m_options.outputWidth = outputWidth;
     m_options.outputHeight = outputHeight;
     (void)slDLSSSetOptions(viewport, m_options);
     sl::Constants consts{};
-    consts.mvecScale.x = (renderWidth > 0) ? (1.0f / (float)renderWidth) : 0.0f;
-    consts.mvecScale.y = (renderHeight > 0) ? (1.0f / (float)renderHeight) : 0.0f;
+    consts.mvecScale.x = (renderWidth > 0) ? (1.0f / (float)renderWidth) : 1.0f;
+    consts.mvecScale.y = (renderHeight > 0) ? (1.0f / (float)renderHeight) : 1.0f;
     consts.jitterOffset.x = 0.0f; consts.jitterOffset.y = 0.0f;
+    // Provide sane defaults for validation (will be refined when camera data is available)
+    // Matrices: set to identity (row-major) to avoid 'invalid' warnings until real values are wired
+    auto setIdentity = [](sl::float4x4& m) {
+        m.setRow(0, sl::float4(1.f, 0.f, 0.f, 0.f));
+        m.setRow(1, sl::float4(0.f, 1.f, 0.f, 0.f));
+        m.setRow(2, sl::float4(0.f, 0.f, 1.f, 0.f));
+        m.setRow(3, sl::float4(0.f, 0.f, 0.f, 1.f));
+    };
+    setIdentity(consts.cameraViewToClip);
+    setIdentity(consts.clipToCameraView);
+    setIdentity(consts.clipToPrevClip);
+    setIdentity(consts.prevClipToClip);
+    consts.cameraNear = 0.1f;
+    consts.cameraFar  = 10000.0f;
+    // Rough aspect from output (fallback)
+    const float outAspect = (outputHeight > 0) ? (float)outputWidth / (float)outputHeight : 1.0f;
+    consts.cameraAspectRatio = outAspect;
+    // Provide a plausible FOV placeholder (radians)
+    consts.cameraFOV = 1.0f;
+    // Camera basis defaults
+    consts.cameraPos = sl::float3(0.f, 0.f, 0.f);
+    consts.cameraUp = sl::float3(0.f, 1.f, 0.f);
+    consts.cameraRight = sl::float3(1.f, 0.f, 0.f);
+    consts.cameraFwd = sl::float3(0.f, 0.f, 1.f);
+    consts.cameraPinholeOffset = sl::float2(0.f, 0.f);
+    // Assume 2D pixel-space motion vectors by default
+    consts.motionVectorsInvalidValue = 0.0f;
+    consts.depthInverted = sl::Boolean::eFalse;
+    consts.cameraMotionIncluded = sl::Boolean::eFalse;
+    consts.motionVectors3D = sl::Boolean::eFalse;
     consts.reset = resetHistory ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     (void)slSetConstants(consts, *m_frameToken, viewport);
 
@@ -385,7 +428,10 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
     }
 
     _MESSAGE("[SL] ProcessEye: eye=%d", eyeIndex);
-    _MESSAGE("[SL] Evaluate: in=%ux%u out=%ux%u depth=%d mv=%d", renderWidth, renderHeight, outputWidth, outputHeight, inputDepth?1:0, inputMotionVectors?1:0);
+    _MESSAGE("[SL] Evaluate: in=%ux%u(outTex=%ux%u) out=%ux%u(outTex=%ux%u) depth=%d mv=%d",
+             renderWidth, renderHeight, inDesc.Width, inDesc.Height,
+             outputWidth, outputHeight, out.width, out.height,
+             inputDepth?1:0, inputMotionVectors?1:0);
     const sl::BaseStructure* inputs[] = { reinterpret_cast<const sl::BaseStructure*>(&viewport) };
     sl::Result rEval = slEvaluateFeature(sl::kFeatureDLSS, *m_frameToken, inputs, 1, reinterpret_cast<sl::CommandBuffer*>(m_context));
     if (rEval != sl::Result::eOk) {
