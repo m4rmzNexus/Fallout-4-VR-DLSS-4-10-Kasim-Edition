@@ -268,15 +268,33 @@ __declspec(dllexport) const char* F4SEPlugin_GetName() {
 
 } // extern "C"
 
-// DLL Entry Point
+// DLL Entry Point (with early attach logging)
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     switch (ul_reason_for_call) {
         case DLL_PROCESS_ATTACH:
             DisableThreadLibraryCalls(hModule);
+            // Early marker to verify DLL loaded even if F4SE doesn't call Query yet
+            {
+                const std::string logPath = GetDocumentsLogPath();
+                std::string dir = logPath;
+                size_t pos = dir.find_last_of("/\\");
+                if (pos != std::string::npos) {
+                    dir = dir.substr(0, pos);
+                    SHCreateDirectoryExA(NULL, dir.c_str(), NULL);
+                }
+                if (FILE* log = fopen(logPath.c_str(), "a")) {
+                    fprintf(log, "[INIT] DllMain PROCESS_ATTACH\n");
+                    fclose(log);
+                }
+            }
             break;
         case DLL_PROCESS_DETACH:
             // Cleanup
             F4SEVR_Upscaler::GetSingleton()->Shutdown();
+            break;
+        case DLL_THREAD_ATTACH:
+        case DLL_THREAD_DETACH:
+        default:
             break;
     }
     return TRUE;
