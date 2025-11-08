@@ -93,7 +93,7 @@ namespace {
     // Phase 1 (viewport clamp) state
     std::atomic<bool> g_sceneActive{false};
     D3D11_TEXTURE2D_DESC g_sceneRTDesc{};
-    int g_clampLogBudgetPerFrame = 4;
+    int g_clampLogBudgetPerFrame = 4;\n    bool g_compositedThisFrame = false;
     // Phase 2 (RT redirect) state and cache
     std::atomic<bool> g_redirectUsedThisFrame{false};
     struct RedirectEntry {
@@ -276,8 +276,7 @@ HRESULT WINAPI HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT
         // Reset Phase 1 scene/clamp state per frame
         g_sceneActive.store(false, std::memory_order_relaxed);
         g_sceneRTDesc = {};
-        g_clampLogBudgetPerFrame = 4;
-        g_redirectUsedThisFrame.store(false, std::memory_order_relaxed);
+        g_clampLogBudgetPerFrame = 4;`r`n        g_compositedThisFrame = false;`r`n        g_redirectUsedThisFrame.store(false, std::memory_order_relaxed);
         if (g_pendingResizeHook && pSwapChain && !g_resizeHookInstalled) {
             if (InstallResizeHook(pSwapChain)) {
                 _MESSAGE("Deferred IDXGISwapChain::ResizeBuffers hook installed");
@@ -558,7 +557,24 @@ namespace {
         }
 
         ID3D11Texture2D* motionVectors = g_motionVectorTexture;
-        ID3D11Texture2D* processedTexture = nullptr;
+        ID3D11Texture2D* processedTexture = nullptr;        // Prefer small redirected RT as DLSS input if available
+        if (colorTexture && g_dlssConfig && g_dlssConfig->earlyDlssEnabled && g_dlssConfig->earlyDlssMode == 1) {
+            ID3D11Texture2D* candidateSmall = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(g_redirectMutex);
+                // Look up by big color texture key
+                auto it = g_redirectMap.find(colorTexture);
+                if (it != g_redirectMap.end() && it->second.smallTex) {
+                    candidateSmall = it->second.smallTex;
+                    if (g_dlssConfig->debugEarlyDlss) {
+                        _MESSAGE("[EarlyDLSS][Submit] Using small RT as DLSS input");
+                    }
+                }
+            }
+            if (candidateSmall) {
+                colorTexture = candidateSmall;
+            }
+        }
         const bool dlssReady = EnsureDLSSRuntimeReady();
 
         // Track per-eye display size using OpenVR recommended target size (more stable than texture size)
@@ -1206,7 +1222,7 @@ namespace DLSSHooks {
         return true;
     }
 
-    void STDMETHODCALLTYPE HookedOMSetRenderTargets(ID3D11DeviceContext* ctx, UINT numRTVs, ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV) {
+    void STDMETHODCALLTYPE HookedOMSetRenderTargets(ID3D11DeviceContext* ctx, UINT numRTVs, ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV) {`n        // Composite small->big if a post/HUD big RT is bound after redirect`n        if (ppRTVs && numRTVs>0 && ppRTVs[0]) { CompositeIfNeededOnBigBind(ppRTVs[0]); }
         if (!ppRTVs || numRTVs == 0 || !ppRTVs[0]) {
             if (RealOMSetRenderTargets) RealOMSetRenderTargets(ctx, numRTVs, ppRTVs, pDSV);
             return;
@@ -1366,3 +1382,30 @@ static ID3D11RenderTargetView* GetOrCreateSmallRTVFor(ID3D11RenderTargetView* bi
     bigTex->Release();
     return e.smallRTV;
 }
+
+    // If a big scene RT gets rebound after redirect, composite small->big once
+    static void CompositeIfNeededOnBigBind(ID3D11RenderTargetView* bigRTV) {
+        if (!g_dlssConfig || !g_dlssConfig->earlyDlssEnabled) return;
+        if (!g_redirectUsedThisFrame.load(std::memory_order_relaxed) || g_compositedThisFrame) return;
+        if (!bigRTV) return;
+        // Resolve big texture key
+        ID3D11Resource* res=nullptr; bigRTV->GetResource(&res); if(!res) return; ID3D11Texture2D* bigTex=nullptr; if(FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D),(void**)&bigTex))){ res->Release(); return; } res->Release();
+        // Lookup mapping
+        RedirectEntry entry{};
+        {
+            std::lock_guard<std::mutex> lock(g_redirectMutex);
+            auto it = g_redirectMap.find(bigTex);
+            if (it == g_redirectMap.end() || !it->second.smallTex) { bigTex->Release(); return; }
+            entry = it->second;
+        }
+        // Use DLSSManager blit helper to copy small->big
+        if (g_dlssManager && entry.smallTex) {
+            if (g_dlssManager->BlitToRTV(entry.smallTex, bigRTV, g_sceneRTDesc.Width, g_sceneRTDesc.Height)) {
+                g_compositedThisFrame = true;
+                if (g_dlssConfig->debugEarlyDlss) {
+                    _MESSAGE("[EarlyDLSS][Composite] small->big %ux%u", g_sceneRTDesc.Width, g_sceneRTDesc.Height);
+                }
+            }
+        }
+        bigTex->Release();
+    }

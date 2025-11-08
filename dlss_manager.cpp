@@ -584,6 +584,62 @@ bool DLSSManager::ComputeRenderSizeForOutput(uint32_t outW, uint32_t outH, uint3
     return true;
 }
 
+bool DLSSManager::BlitToRTV(ID3D11Texture2D* src, ID3D11RenderTargetView* dstRTV, uint32_t dstW, uint32_t dstH) {
+    if (!m_device || !m_context || !src || !dstRTV || dstW == 0 || dstH == 0) {
+        return false;
+    }
+    if (!EnsureDownscaleShaders()) {
+        return false;
+    }
+
+    // Create SRV for src
+    ID3D11ShaderResourceView* srcSRV = nullptr;
+    HRESULT hr = m_device->CreateShaderResourceView(src, nullptr, &srcSRV);
+    if (FAILED(hr) || !srcSRV) {
+        return false;
+    }
+
+    // Save minimal state
+    ID3D11RenderTargetView* oldRTV = nullptr; ID3D11DepthStencilView* oldDSV = nullptr;
+    m_context->OMGetRenderTargets(1, &oldRTV, &oldDSV);
+    D3D11_VIEWPORT oldVP{}; UINT vpCount = 1; m_context->RSGetViewports(&vpCount, &oldVP);
+    D3D11_PRIMITIVE_TOPOLOGY oldTopo; m_context->IAGetPrimitiveTopology(&oldTopo);
+    ID3D11VertexShader* oldVS = nullptr; ID3D11PixelShader* oldPS = nullptr;
+    m_context->VSGetShader(&oldVS, nullptr, nullptr);
+    m_context->PSGetShader(&oldPS, nullptr, nullptr);
+    ID3D11ShaderResourceView* oldSRV = nullptr; m_context->PSGetShaderResources(0, 1, &oldSRV);
+    ID3D11SamplerState* oldSamp = nullptr; m_context->PSGetSamplers(0, 1, &oldSamp);
+
+    // Set viewport and RT
+    D3D11_VIEWPORT vp{}; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)dstW; vp.Height = (float)dstH; vp.MinDepth = 0; vp.MaxDepth = 1;
+    m_context->RSSetViewports(1, &vp);
+    m_context->OMSetRenderTargets(1, &dstRTV, nullptr);
+
+    // Bind FS pipeline
+    m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_context->VSSetShader(m_fsVS, nullptr, 0);
+    m_context->PSSetShader(m_fsPS, nullptr, 0);
+    m_context->PSSetShaderResources(0, 1, &srcSRV);
+    m_context->PSSetSamplers(0, 1, &m_linearSampler);
+    m_context->Draw(3, 0);
+
+    // Unbind and restore
+    ID3D11ShaderResourceView* nullSRV[1] = { nullptr };
+    m_context->PSSetShaderResources(0, 1, nullSRV);
+
+    m_context->OMSetRenderTargets(1, &oldRTV, oldDSV);
+    if (oldRTV) oldRTV->Release(); if (oldDSV) oldDSV->Release();
+    m_context->RSSetViewports(vpCount, &oldVP);
+    m_context->IASetPrimitiveTopology(oldTopo);
+    m_context->VSSetShader(oldVS, nullptr, 0);
+    m_context->PSSetShader(oldPS, nullptr, 0);
+    if (oldVS) oldVS->Release(); if (oldPS) oldPS->Release();
+    if (oldSRV) { ID3D11ShaderResourceView* r[1] = { oldSRV }; m_context->PSSetShaderResources(0, 1, r); oldSRV->Release(); }
+    if (oldSamp) { ID3D11SamplerState* s[1] = { oldSamp }; m_context->PSSetSamplers(0, 1, s); oldSamp->Release(); }
+    if (srcSRV) srcSRV->Release();
+    return true;
+}
+
 namespace {
     bool CreateOutputTexture(ID3D11Device* device,
                               const D3D11_TEXTURE2D_DESC& inputDesc,

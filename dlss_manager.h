@@ -76,6 +76,10 @@ public:
     // back to the static quality scale table otherwise. Returns true on success.
     bool ComputeRenderSizeForOutput(uint32_t outW, uint32_t outH, uint32_t& renderW, uint32_t& renderH);
 
+    // Utility: blit a source texture into a destination RTV at given size using
+    // the internal fullscreen VS/PS (linear sampling). Saves/restores minimal state.
+    bool BlitToRTV(ID3D11Texture2D* src, ID3D11RenderTargetView* dstRTV, uint32_t dstW, uint32_t dstH);
+
 private:
     // Per-eye DLSS contexts for VR
     struct EyeContext {
