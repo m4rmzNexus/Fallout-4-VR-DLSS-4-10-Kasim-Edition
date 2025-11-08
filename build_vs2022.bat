@@ -118,10 +118,7 @@ if defined NGX_SDK_PATH (
     )
 )
 
-rem Delay-load Streamline interposer to avoid hard runtime dependency at plugin load time
-set "_DELAY=/DELAYLOAD:sl.interposer.dll Delayimp.lib"
-
-link.exe /DLL /OUT:"%OUTDIR%\F4SEVR_DLSS.dll" /DEF:"exports.def" %_NGX_LIBPATH% %SL_LINK% %_DELAY% ^
+link.exe /DLL /OUT:"%OUTDIR%\F4SEVR_DLSS.dll" /DEF:"exports.def" %_NGX_LIBPATH% %SL_LINK% ^
     "obj\main.obj" ^
     "obj\F4SEVR_Upscaler.obj" ^
     "obj\ImGui_Menu.obj" ^
