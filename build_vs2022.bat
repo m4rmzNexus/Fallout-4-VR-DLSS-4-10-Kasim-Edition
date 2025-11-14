@@ -41,13 +41,25 @@ if defined NGX_SDK_PATH (
 :: Detect Streamline SDK and configure outside the detection block to avoid % expansion pitfalls
 if exist "%~dp0streamline-sdk-v2.9.0\include\sl.h" set "SL_SDK_PATH=%~dp0streamline-sdk-v2.9.0"
 
+set "SL_LINK="
+set "SL_LIB_FULL="
+set "SL_LIB_ARG="
+
 if defined SL_SDK_PATH (
     echo Using SL_SDK_PATH=%SL_SDK_PATH%
     set "INCLUDE_SWITCHES=%INCLUDE_SWITCHES% /I""!SL_SDK_PATH!\include"""
     set "CL_COMPILE_FLAGS=%CL_COMPILE_FLAGS% /DUSE_STREAMLINE=1"
     set "INCLUDE=%INCLUDE%;!SL_SDK_PATH!\include"
-    set "SL_LINK=/LIBPATH:"!SL_SDK_PATH!\lib\x64""
-    set "SL_LIB_FULL=!SL_SDK_PATH!\lib\x64\sl.interposer.lib"
+    set "SL_LIB_DIR=%SL_SDK_PATH%\lib\x64"
+    if exist "%SL_LIB_DIR%\sl.interposer.lib" (
+        set "SL_LINK=/LIBPATH:\"%SL_LIB_DIR%\""
+        set "SL_LIB_FULL=%SL_LIB_DIR%\sl.interposer.lib"
+        set "SL_LIB_ARG=\"%SL_LIB_FULL%\""
+    ) else (
+        echo [WARN] Streamline library not found under %SL_LIB_DIR%. DLSS Streamline backend cannot be linked.
+    )
+) else (
+    echo [WARN] SL_SDK_PATH not defined; Streamline backend disabled for this build.
 )
 
 echo Final INCLUDE_SWITCHES: %INCLUDE_SWITCHES%
@@ -133,8 +145,8 @@ link.exe /DLL /OUT:"%OUTDIR%\F4SEVR_DLSS.dll" /DEF:"exports.def" %_NGX_LIBPATH% 
     "obj\imgui_demo.obj" ^
     "obj\imgui_impl_dx11.obj" ^
     "obj\imgui_impl_win32.obj" ^
-    user32.lib kernel32.lib d3d11.lib dxgi.lib uuid.lib d3dcompiler.lib dwmapi.lib gdi32.lib advapi32.lib shell32.lib ^
-    %_NGX_LIB% "%SL_LIB_FULL%"
+    user32.lib kernel32.lib d3d11.lib dxgi.lib uuid.lib d3dcompiler.lib dwmapi.lib gdi32.lib advapi32.lib crypt32.lib wintrust.lib shell32.lib ^
+    %_NGX_LIB% %SL_LIB_ARG%
 if %ERRORLEVEL% NEQ 0 goto error
 
 echo.
@@ -157,14 +169,24 @@ copy /Y "%OUTDIR%\F4SEVR_DLSS.dll" "%DIST_MO2%\F4SEVR_DLSS.dll" >nul 2>&1
 copy /Y "F4SEVR_DLSS.ini" "%DIST_MO2%\F4SEVR_DLSS.ini" >nul 2>&1
 set "SL_BIN=%SL_SDK_PATH%\bin\x64"
 if defined SL_SDK_PATH (
-    if exist "%SL_BIN%\sl.interposer.dll" copy /Y "%SL_BIN%\sl.interposer.dll" "%DIST_ROOT%\sl.interposer.dll" >nul 2>&1
-    if exist "%SL_BIN%\sl.common.dll" copy /Y "%SL_BIN%\sl.common.dll" "%DIST_ROOT%\sl.common.dll" >nul 2>&1
-    if exist "%SL_BIN%\sl.dlss.dll" copy /Y "%SL_BIN%\sl.dlss.dll" "%DIST_ROOT%\sl.dlss.dll" >nul 2>&1
-    if exist "%SL_BIN%\sl.pcl.dll" copy /Y "%SL_BIN%\sl.pcl.dll" "%DIST_ROOT%\sl.pcl.dll" >nul 2>&1
-    if exist "%SL_BIN%\sl.reflex.dll" copy /Y "%SL_BIN%\sl.reflex.dll" "%DIST_ROOT%\sl.reflex.dll" >nul 2>&1
-    if exist "%SL_BIN%\nvngx_dlss.dll" copy /Y "%SL_BIN%\nvngx_dlss.dll" "%DIST_ROOT%\nvngx_dlss.dll" >nul 2>&1
-    rem NOTE: Frame Generation is explicitly disabled for VR; do NOT package nvngx_dlssg.dll
-    rem if exist "%SL_BIN%\nvngx_dlssd.dll" copy /Y "%SL_BIN%\nvngx_dlssd.dll" "%DIST_ROOT%\nvngx_dlssd.dll" >nul 2>&1
+    for %%f in (
+        sl.interposer.dll
+        sl.common.dll
+        sl.dlss.dll
+        sl.pcl.dll
+        sl.reflex.dll
+        nvngx_dlss.dll
+        nvngx_dlssd.dll
+        nvngx_dlssg.dll
+        nvngx_deepdvc.dll
+    ) do (
+        if exist "%SL_BIN%\%%f" (
+            echo Copying %%f to %DIST_ROOT%
+            copy /Y "%SL_BIN%\%%f" "%DIST_ROOT%\%%f" >nul 2>&1
+        ) else (
+            echo [WARN] Missing SL/NGX binary: %%f
+        )
+    )
 )
 > "%DIST%\README.txt" echo F4SEVR_DLSS Packaging
 >> "%DIST%\README.txt" echo ----------------------

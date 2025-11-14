@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string>
 #include <fstream>
+#include "LogUtils.h"
 
 F4SEVR_Upscaler* F4SEVR_Upscaler::instance = nullptr;
 
@@ -72,11 +73,8 @@ bool F4SEVR_Upscaler::Initialize(ID3D11Device* d3dDevice, IDXGISwapChain* dxgiSw
     HMODULE vrModule = GetModuleHandleA("openvr_api.dll");
     if (vrModule) {
         isVR = true;
-        FILE* log = fopen("F4SEVR_DLSS.log", "a");
-        if (log) {
-            fprintf(log, "VR Mode detected - OpenVR API found\n");
-            fclose(log);
-        }
+        #include "LogUtils.h"
+        LogUtils::Logf("VR Mode detected - OpenVR API found");
     }
     
     return InitializeUpscaler();
@@ -84,17 +82,19 @@ bool F4SEVR_Upscaler::Initialize(ID3D11Device* d3dDevice, IDXGISwapChain* dxgiSw
 
 void F4SEVR_Upscaler::Shutdown() {
     ShutdownUpscaler();
-    
+
     colorBuffer.Release();
     depthBuffer.Release();
     motionVectorBuffer.Release();
     transparentMask.Release();
     opaqueColor.Release();
     outputBuffer.Release();
+    ReleaseCopyTexture(depthCopyTexture);
+    ReleaseCopyTexture(motionVectorCopyTexture);
 
-    DLSSHooks::RegisterMotionVectorTexture(nullptr);
-    DLSSHooks::RegisterFallbackDepthTexture(nullptr);
-    
+    DLSSHooks::RegisterMotionVectorTexture(nullptr, nullptr, 0, 0);
+    DLSSHooks::RegisterFallbackDepthTexture(nullptr, nullptr, 0, 0);
+
     if (context) {
         context->Release();
         context = nullptr;
@@ -102,12 +102,9 @@ void F4SEVR_Upscaler::Shutdown() {
 }
 
 bool F4SEVR_Upscaler::InitializeUpscaler() {
-    FILE* log = fopen("F4SEVR_DLSS.log", "a");
-    if (log) {
-        fprintf(log, "Initializing upscaler - Type: %d, Quality: %d\n", currentUpscaler, currentQuality);
-        fprintf(log, "Display: %dx%d, Render: %dx%d\n", displayWidth, displayHeight, renderWidth, renderHeight);
-        fclose(log);
-    }
+    #include "LogUtils.h"
+    LogUtils::Logf("Initializing upscaler - Type: %d, Quality: %d", currentUpscaler, currentQuality);
+    LogUtils::Logf("Display: %dx%d, Render: %dx%d", displayWidth, displayHeight, renderWidth, renderHeight);
     
     // Initialize based on selected upscaler
     switch (currentUpscaler) {
@@ -202,7 +199,36 @@ void F4SEVR_Upscaler::ProcessFrame() {
     if (!device || !context) {
         return;
     }
-    
+
+    auto refreshMotion = [&]() {
+        if (!motionVectorBuffer.texture) {
+            return;
+        }
+        bool recreated = false;
+        ID3D11Texture2D* copy = CopyTextureToSRV(motionVectorBuffer.texture, motionVectorCopyTexture, &recreated);
+        if (copy && recreated) {
+            D3D11_TEXTURE2D_DESC desc{};
+            copy->GetDesc(&desc);
+            DLSSHooks::RegisterMotionVectorTexture(copy, &desc, displayWidth, displayHeight);
+        }
+    };
+
+    auto refreshDepth = [&]() {
+        if (!depthBuffer.texture) {
+            return;
+        }
+        bool recreated = false;
+        ID3D11Texture2D* copy = CopyTextureToSRV(depthBuffer.texture, depthCopyTexture, &recreated);
+        if (copy && recreated) {
+            D3D11_TEXTURE2D_DESC desc{};
+            copy->GetDesc(&desc);
+            DLSSHooks::RegisterFallbackDepthTexture(copy, &desc, displayWidth, displayHeight);
+        }
+    };
+
+    refreshMotion();
+    refreshDepth();
+
     // Apply fixed foveated rendering for VR
     if (isVR && enableFixedFoveatedRendering) {
         ApplyFixedFoveatedRendering();
@@ -288,9 +314,23 @@ void F4SEVR_Upscaler::SetupDepthBuffer(ID3D11Texture2D* texture) {
     depthBuffer.texture = texture;
     if (texture) {
         texture->AddRef();
+    } else {
+        ReleaseCopyTexture(depthCopyTexture);
+        DLSSHooks::RegisterFallbackDepthTexture(nullptr, nullptr, 0, 0);
+        return;
     }
 
-    DLSSHooks::RegisterFallbackDepthTexture(texture);
+    bool recreated = false;
+    ID3D11Texture2D* copy = CopyTextureToSRV(texture, depthCopyTexture, &recreated);
+    if (copy) {
+        if (recreated) {
+            D3D11_TEXTURE2D_DESC copyDesc{};
+            copy->GetDesc(&copyDesc);
+            DLSSHooks::RegisterFallbackDepthTexture(copy, &copyDesc, displayWidth, displayHeight);
+        }
+    } else {
+        DLSSHooks::RegisterFallbackDepthTexture(nullptr, nullptr, 0, 0);
+    }
 }
 
 
@@ -298,9 +338,23 @@ void F4SEVR_Upscaler::SetupMotionVector(ID3D11Texture2D* texture) {
     motionVectorBuffer.texture = texture;
     if (texture) {
         texture->AddRef();
+    } else {
+        ReleaseCopyTexture(motionVectorCopyTexture);
+        DLSSHooks::RegisterMotionVectorTexture(nullptr, nullptr, 0, 0);
+        return;
     }
 
-    DLSSHooks::RegisterMotionVectorTexture(texture);
+    bool recreated = false;
+    ID3D11Texture2D* copy = CopyTextureToSRV(texture, motionVectorCopyTexture, &recreated);
+    if (copy) {
+        if (recreated) {
+            D3D11_TEXTURE2D_DESC copyDesc{};
+            copy->GetDesc(&copyDesc);
+            DLSSHooks::RegisterMotionVectorTexture(copy, &copyDesc, displayWidth, displayHeight);
+        }
+    } else {
+        DLSSHooks::RegisterMotionVectorTexture(nullptr, nullptr, 0, 0);
+    }
 }
 
 
@@ -440,3 +494,58 @@ void ImageWrapper::Release() {
 
 
 
+ID3D11Texture2D* F4SEVR_Upscaler::CopyTextureToSRV(ID3D11Texture2D* source, ID3D11Texture2D*& cache, bool* outRecreated) {
+    if (!source || !device || !context) {
+        if (outRecreated) {
+            *outRecreated = false;
+        }
+        return nullptr;
+    }
+
+    D3D11_TEXTURE2D_DESC srcDesc{};
+    source->GetDesc(&srcDesc);
+
+    D3D11_TEXTURE2D_DESC existingDesc{};
+    bool needNew = true;
+    if (cache) {
+        cache->GetDesc(&existingDesc);
+        needNew = existingDesc.Width != srcDesc.Width ||
+                  existingDesc.Height != srcDesc.Height ||
+                  existingDesc.Format != srcDesc.Format;
+    }
+
+    if (needNew) {
+        ReleaseCopyTexture(cache);
+        D3D11_TEXTURE2D_DESC desc = srcDesc;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.SampleDesc.Count = 1;
+        desc.SampleDesc.Quality = 0;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.CPUAccessFlags = 0;
+        desc.MiscFlags = 0;
+        if (FAILED(device->CreateTexture2D(&desc, nullptr, &cache))) {
+            cache = nullptr;
+            if (outRecreated) {
+                *outRecreated = false;
+            }
+            return nullptr;
+        }
+        if (outRecreated) {
+            *outRecreated = true;
+        }
+    } else if (outRecreated) {
+        *outRecreated = false;
+    }
+
+    context->CopyResource(cache, source);
+    return cache;
+}
+
+void F4SEVR_Upscaler::ReleaseCopyTexture(ID3D11Texture2D*& cache) {
+    if (cache) {
+        cache->Release();
+        cache = nullptr;
+    }
+}

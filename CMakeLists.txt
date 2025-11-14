@@ -86,10 +86,22 @@ if(USE_STREAMLINE)
     if(EXISTS "${SL_SDK_PATH}/include/sl.h")
         target_compile_definitions(${PROJECT_NAME} PRIVATE USE_STREAMLINE=1)
         target_include_directories(${PROJECT_NAME} PUBLIC "${SL_SDK_PATH}/include")
-        message(STATUS "Streamline SDK enabled: ${SL_SDK_PATH}")
+
+        set(_SL_LIB_DIR "${SL_SDK_PATH}/lib/x64")
+        if(EXISTS "${_SL_LIB_DIR}/sl.interposer.lib")
+            target_link_directories(${PROJECT_NAME} PRIVATE "${_SL_LIB_DIR}")
+            target_link_libraries(${PROJECT_NAME} PUBLIC sl.interposer.lib)
+            message(STATUS "Streamline SDK enabled: ${SL_SDK_PATH}")
+            message(STATUS "Linking against Streamline interposer: ${_SL_LIB_DIR}/sl.interposer.lib")
+        else()
+            message(WARNING "Streamline library sl.interposer.lib not found under ${_SL_LIB_DIR}. Streamline support will be disabled.")
+            target_compile_definitions(${PROJECT_NAME} PRIVATE USE_STREAMLINE=0)
+            set(USE_STREAMLINE OFF CACHE BOOL "Enable NVIDIA Streamline backend for DLSS" FORCE)
+        endif()
     else()
         message(WARNING "USE_STREAMLINE is ON but SL headers not found under ${SL_SDK_PATH}; disabling")
         target_compile_definitions(${PROJECT_NAME} PRIVATE USE_STREAMLINE=0)
+        set(USE_STREAMLINE OFF CACHE BOOL "Enable NVIDIA Streamline backend for DLSS" FORCE)
     endif()
 endif()
 
@@ -109,6 +121,8 @@ target_link_libraries(
         kernel32
         uuid
         advapi32
+        crypt32
+        wintrust
         shell32
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/f4sevr_1_2_72.lib
         ${CMAKE_CURRENT_SOURCE_DIR}/lib/f4se_common.lib
@@ -136,8 +150,6 @@ if(MSVC)
     # Export F4SEPlugin_* symbols via .def
     target_link_options(${PROJECT_NAME} PRIVATE "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/exports.def")
 endif()
-
-
 
 
 

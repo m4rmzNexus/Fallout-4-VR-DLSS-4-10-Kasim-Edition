@@ -39,6 +39,7 @@ public:
     void BeginFrame();
     void EndFrame();
     void SetCurrentEyeIndex(int eyeIndex);
+    void AbortFrame();
 #endif
 
 private:

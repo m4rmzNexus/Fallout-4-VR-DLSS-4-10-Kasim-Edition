@@ -16,6 +16,7 @@ public:
     
     void Load();
     void Save();
+    void ForceDisableEarlyDlss(const char* reason = nullptr);
 
     // Preferred save path (Documents). Remains for backward compatibility.
     static std::string GetConfigPath();
@@ -49,6 +50,10 @@ public:
     bool enableTransformerModel = true;  // New DLSS 4 transformer model
     bool enableRayReconstruction = false;
 
+    // Backend selection
+    // If true, only Streamline (SL) backend is allowed; NGX fallback is disabled
+    bool streamlineOnly = false;
+
     // VR specific settings
     bool enableFixedFoveatedRendering = true;
     float foveatedInnerRadius = 0.8f;
@@ -73,15 +78,19 @@ public:
     int cycleUpscalerKey = 0x2D;   // VK_INSERT
 
     // Early DLSS integration (render-time) flags
-    bool earlyDlssEnabled = false;       // Faz 1/2 entegrasyonu aç/kapa
-    int  earlyDlssMode = 0;              // 0=viewport clamp, 1=rt_redirect
+    bool earlyDlssEnabled = false;       // Disabled by default; enable from menu/INI if desired
+    int  earlyDlssMode = 1;              // 0=viewport clamp, 1=rt_redirect (PureDark tarzı gerçek render küçültme)
     bool peripheryTAAEnabled = true;     // DLSS dikdörtgeni dışını TAA ile çöz
     bool foveatedRenderingEnabled = false; // FFR/FFU ana bayrak
-    bool debugEarlyDlss = false;         // Geniş log
+    bool debugEarlyDlss = true;          // Geniş log
+
+    // Submit-time copy of DLSS result back into submitted eye texture
+    // Siyah ekran/uyumsuzluk şüphesi durumunda kapatılabilir.
+    bool submitCopyEnabled = true;
 
     // Guardrails / IQ options
-    bool enablePerEyeCap = false;        // Optional cap to protect against extreme SS
-    int  perEyeMaxDim = 4096;            // Max per-eye dimension when cap is enabled
+    bool enablePerEyeCap = false;        // Guardrail off by default for high-VRAM rigs (RTX 5090)
+    int  perEyeMaxDim = 8192;            // Safety ceiling if enabled (aligns with SL practical limits)
     bool highQualityComposite = false;   // Use HQ composite path for small->big (optional)
 
 private:

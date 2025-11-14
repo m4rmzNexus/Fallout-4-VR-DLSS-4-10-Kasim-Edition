@@ -9,6 +9,10 @@
 #include <shlobj.h>
 #include <string>
 #include <dxgi.h>
+#include <atomic>
+#ifdef USE_STREAMLINE
+#include <sl_security.h>
+#endif
 
 namespace {
     // SL -> our log bridge
@@ -21,6 +25,13 @@ namespace {
             default: _MESSAGE("[SL] %s", msg); break;
         }
     }
+
+    bool ShouldLogSLFrame() {
+        static std::atomic<uint32_t> counter{0};
+        uint32_t value = counter.fetch_add(1, std::memory_order_relaxed) + 1u;
+        return (value % 240u) == 1u;
+    }
+
     std::wstring GetDocumentsSLPath() {
         wchar_t docs[MAX_PATH] = {};
         if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_MYDOCUMENTS, NULL, 0, docs))) {
@@ -48,6 +59,33 @@ namespace {
         return p;
     }
 
+#ifdef USE_STREAMLINE
+    bool VerifyStreamlineRuntime(const std::wstring& baseDir) {
+        if (baseDir.empty()) {
+            _ERROR("[SL] Game directory path is empty; cannot verify Streamline binaries.");
+            return false;
+        }
+
+        std::wstring interposer = baseDir + L"sl.interposer.dll";
+        if (GetFileAttributesW(interposer.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            _ERROR("[SL] Expected Streamline binary missing: %S", interposer.c_str());
+            return false;
+        }
+
+        if (!sl::security::verifyEmbeddedSignature(interposer.c_str())) {
+            _ERROR("[SL] Signature verification failed for %S", interposer.c_str());
+            return false;
+        }
+
+        static bool loggedSuccess = false;
+        if (!loggedSuccess) {
+            _MESSAGE("[SL] Verified digital signature for %S", interposer.c_str());
+            loggedSuccess = true;
+        }
+        return true;
+    }
+#endif
+
     DXGI_FORMAT ResolveDepthFormat(DXGI_FORMAT format) {
         switch (format) {
             case DXGI_FORMAT_R24G8_TYPELESS: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
@@ -72,6 +110,9 @@ bool SLBackend::Init(ID3D11Device* device, ID3D11DeviceContext* context) {
     static const sl::Feature kFeatures[] = { sl::kFeatureDLSS };
     std::wstring logs = GetDocumentsSLPath();
     std::wstring gameDir = GetGameDir();
+    if (!VerifyStreamlineRuntime(gameDir)) {
+        return false;
+    }
 
     const wchar_t* paths[] = { gameDir.c_str() };
 
@@ -97,8 +138,12 @@ bool SLBackend::Init(ID3D11Device* device, ID3D11DeviceContext* context) {
     // Keep numeric applicationId at 0 unless an NVIDIA-provided ID is available
     pref.applicationId = 0; // can be replaced with a real numeric app id if assigned
     pref.renderAPI = sl::RenderAPI::eD3D11;
-    _MESSAGE("[SL] Init: plugins=%S, logs=%S, features=%u", paths[0], logs.c_str(), pref.numFeaturesToLoad);
-    _MESSAGE("[SL] OTA disabled; local plugins only (no ProgramData)");
+    static bool s_loggedInitPaths = false;
+    if (!s_loggedInitPaths) {
+        _MESSAGE("[SL] Init: plugins=%S, logs=%S, features=%u", paths[0], logs.c_str(), pref.numFeaturesToLoad);
+        _MESSAGE("[SL] OTA disabled; local plugins only (no ProgramData)");
+        s_loggedInitPaths = true;
+    }
     sl::Result r = slInit(pref);
     if (r != sl::Result::eOk) {
         _ERROR("[SL] slInit failed: %d", (int)r);
@@ -260,6 +305,17 @@ void SLBackend::EndFrame() {
 #endif
 }
 
+void SLBackend::AbortFrame() {
+#ifdef USE_STREAMLINE
+    if (!m_frameActive && !m_frameToken && m_frameEyeCount == 0) {
+        return;
+    }
+    m_frameToken = nullptr;
+    m_frameActive = false;
+    m_frameEyeCount = 0;
+#endif
+}
+
 void SLBackend::SetCurrentEyeIndex(int eyeIndex) {
 #ifdef USE_STREAMLINE
     if (eyeIndex < 0) eyeIndex = 0;
@@ -281,12 +337,14 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
     return inputColor;
 #else
     if (!m_ready || !inputColor || outputWidth == 0 || outputHeight == 0) {
+        AbortFrame();
         return inputColor;
     }
 
     if (!m_frameActive || !m_frameToken) {
         BeginFrame();
         if (!m_frameActive || !m_frameToken) {
+            AbortFrame();
             return inputColor;
         }
     }
@@ -307,16 +365,26 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
         viewport = sl::ViewportHandle(eyeIndex + 1);
     }
 
+    const unsigned int prevInW = vpInW;
+    const unsigned int prevInH = vpInH;
+    const unsigned int prevOutW = vpOutW;
+    const unsigned int prevOutH = vpOutH;
     bool needRealloc = (!vpAllocated || vpInW != renderWidth || vpInH != renderHeight || vpOutW != outputWidth || vpOutH != outputHeight);
     if (needRealloc) {
         // Hard safety: DLSS has practical limits (~8K). If output exceeds, skip DLSS for this frame.
         if (outputWidth > 8192u || outputHeight > 8192u) {
             _ERROR("[SL] Output too large for DLSS (%ux%u) - reduce VR SS; falling back to native this frame", outputWidth, outputHeight);
+            AbortFrame();
             return inputColor;
         }
         // Free any previous allocations for this viewport; Streamline will re-allocate lazily on evaluate
         slFreeResources(sl::kFeatureDLSS, viewport);
         vpAllocated = false;
+        if (ShouldLogSLFrame()) {
+            _MESSAGE("[SL] Viewport realloc eye=%d in %ux%u->%ux%u out %ux%u->%ux%u",
+                     eyeIndex, prevInW, prevInH, renderWidth, renderHeight,
+                     prevOutW, prevOutH, outputWidth, outputHeight);
+        }
     }
 
     // Wrap resources
@@ -360,7 +428,7 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
     color.height = needScratchIn ? renderHeight : inDesc.Height;
     color.nativeFormat = static_cast<uint32_t>(inDesc.Format);
 
-    // Build extents as full-rects (left=0, top=0) and clamp to resource sizes
+    // Build extents with optional SxS/TB crop for stereo atlases
     auto clampTo = [](uint32_t wantW, uint32_t wantH, uint32_t resW, uint32_t resH) -> sl::Extent {
         sl::Extent e{};
         e.left = 0; e.top = 0;
@@ -371,7 +439,24 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
         return e;
     };
 
-    const sl::Extent inExtent = clampTo(renderWidth, renderHeight, color.width, color.height);
+    sl::Extent inExtent = clampTo(renderWidth, renderHeight, color.width, color.height);
+    const bool colorMatchesRender = (color.width == renderWidth && color.height == renderHeight);
+    if (!colorMatchesRender) {
+        // Heuristic crop only when fallback textures still use atlas
+        const bool looksSxS = (color.width >= (uint32_t)((float)color.height * 1.7f));
+        const bool looksTB  = (!looksSxS) && (color.height >= (uint32_t)((float)color.width * 1.7f));
+        if (looksSxS) {
+            const uint32_t halfW = color.width / 2u;
+            if (inExtent.width > halfW) inExtent.width = halfW;
+            inExtent.left = (eyeIndex == 0) ? 0 : halfW;
+            inExtent.top = 0;
+        } else if (looksTB) {
+            const uint32_t halfH = color.height / 2u;
+            if (inExtent.height > halfH) inExtent.height = halfH;
+            inExtent.left = 0;
+            inExtent.top = (eyeIndex == 0) ? 0 : halfH;
+        }
+    }
 
     sl::ResourceTag tags[5] = {
         sl::ResourceTag(&color, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &inExtent)
@@ -385,7 +470,9 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
         depth.type = sl::ResourceType::eTex2d;
         depth.width = d.Width; depth.height = d.Height;
         depth.nativeFormat = static_cast<uint32_t>(ResolveDepthFormat(d.Format));
-        const sl::Extent dpExtent = clampTo(renderWidth, renderHeight, d.Width, d.Height);
+        sl::Extent dpExtent = clampTo(renderWidth, renderHeight, d.Width, d.Height);
+        dpExtent.left = inExtent.left;
+        dpExtent.top = inExtent.top;
         tags[numTags++] = sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate, &dpExtent);
     }
 
@@ -395,8 +482,19 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
         mv.native = static_cast<void*>(static_cast<ID3D11Resource*>(inputMotionVectors));
         mv.type = sl::ResourceType::eTex2d;
         mv.width = m.Width; mv.height = m.Height; mv.nativeFormat = static_cast<uint32_t>(m.Format);
-        const sl::Extent mvExtent = clampTo(renderWidth, renderHeight, m.Width, m.Height);
+        sl::Extent mvExtent = clampTo(renderWidth, renderHeight, m.Width, m.Height);
+        mvExtent.left = inExtent.left;
+        mvExtent.top = inExtent.top;
         tags[numTags++] = sl::ResourceTag(&mv, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &mvExtent);
+    }
+
+    if (ShouldLogSLFrame()) {
+        _MESSAGE("[SL] Tag eye=%d in(%u,%u %ux%u) depth=%d mv=%d out=%ux%u",
+                 eyeIndex,
+                 inExtent.left, inExtent.top, inExtent.width, inExtent.height,
+                 inputDepth ? 1 : 0,
+                 inputMotionVectors ? 1 : 0,
+                 outputWidth, outputHeight);
     }
 
     // Output: prefer provided target if UAV-capable; else use scratch output
@@ -407,14 +505,15 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
     if (outputTarget) { outputTarget->GetDesc(&o); }
     const bool needScratchOut = (!outputTarget) || (o.Usage != D3D11_USAGE_DEFAULT) || (o.SampleDesc.Count > 1) || ((o.BindFlags & D3D11_BIND_UNORDERED_ACCESS) == 0);
     if (needScratchOut) {
-        DXGI_FORMAT outFmt = outputTarget ? o.Format : DXGI_FORMAT_R8G8B8A8_UNORM;
+        // Prefer BGRA8 UNORM for VR compositor compatibility
+        DXGI_FORMAT outFmt = outputTarget ? o.Format : DXGI_FORMAT_B8G8R8A8_UNORM;
         bool create = (m_scratchOut[eyeIndex] == nullptr) || m_scratchOutW[eyeIndex] != outputWidth || m_scratchOutH[eyeIndex] != outputHeight || m_scratchOutFmt[eyeIndex] != outFmt;
         if (create) {
             if (m_scratchOut[eyeIndex]) { m_scratchOut[eyeIndex]->Release(); m_scratchOut[eyeIndex] = nullptr; }
             D3D11_TEXTURE2D_DESC s{};
             s.Width = outputWidth; s.Height = outputHeight; s.MipLevels = 1; s.ArraySize = 1;
             s.Format = outFmt; s.SampleDesc.Count = 1; s.SampleDesc.Quality = 0;
-            s.Usage = D3D11_USAGE_DEFAULT; s.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE; s.CPUAccessFlags = 0; s.MiscFlags = 0;
+            s.Usage = D3D11_USAGE_DEFAULT; s.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET; s.CPUAccessFlags = 0; s.MiscFlags = 0;
             HRESULT hr = m_device->CreateTexture2D(&s, nullptr, &m_scratchOut[eyeIndex]);
             if (FAILED(hr)) {
                 _ERROR("[SL] Failed to create scratch output texture (hr=0x%08X)", (unsigned)hr);
@@ -440,8 +539,10 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
     m_options.outputWidth = outputWidth;
     m_options.outputHeight = outputHeight;
     sl::Constants consts{};
+    // Motion vectors normalization: convert pixel-space MVs into [-1,1] (per SL guidance)
     consts.mvecScale.x = (renderWidth > 0) ? (1.0f / (float)renderWidth) : 1.0f;
     consts.mvecScale.y = (renderHeight > 0) ? (1.0f / (float)renderHeight) : 1.0f;
+    // VR: jitter disabled for stereo comfort
     consts.jitterOffset.x = 0.0f; consts.jitterOffset.y = 0.0f;
     // Provide sane defaults for validation (will be refined when camera data is available)
     // Matrices: set to identity (row-major) to avoid 'invalid' warnings until real values are wired
@@ -469,10 +570,12 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
     consts.cameraFwd = sl::float3(0.f, 0.f, 1.f);
     consts.cameraPinholeOffset = sl::float2(0.f, 0.f);
     // Assume 2D pixel-space motion vectors by default
+    // Zero-MV defaults and flags
     consts.motionVectorsInvalidValue = 0.0f;
-    consts.depthInverted = sl::Boolean::eFalse;
-    consts.cameraMotionIncluded = sl::Boolean::eFalse;
+    consts.depthInverted = sl::Boolean::eFalse;           // TODO: set true if engine uses inverted depth
+    consts.cameraMotionIncluded = sl::Boolean::eFalse;     // we do not include camera motion in MV
     consts.motionVectors3D = sl::Boolean::eFalse;
+    consts.motionVectorsJittered = sl::Boolean::eFalse;    // VR jitter disabled
     consts.reset = resetHistory ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     // Per-eye tagging order:
     // 1) Tags -> 2) Constants -> 3) Options -> 4) Evaluate
@@ -480,6 +583,8 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
     sl::Result rt = slSetTagForFrame(*m_frameToken, viewport, tags, numTags, reinterpret_cast<sl::CommandBuffer*>(m_context));
     if (rt != sl::Result::eOk) {
         _ERROR("[SL] slSetTagForFrame failed: %d (tags=%u)", (int)rt, numTags);
+        AbortFrame();
+        return inputColor;
     }
 
     (void)slSetConstants(consts, *m_frameToken, viewport);
@@ -519,9 +624,11 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
         if (errorCount >= 100) {
             _ERROR("[SL] Too many DLSS errors (%d), disabling DLSS", errorCount);
             m_ready = false;
+            AbortFrame();
             return inputColor;
         }
-        
+
+        AbortFrame();
         return inputColor;
     }
     // Mark viewport as allocated and cache sizes after a successful evaluate

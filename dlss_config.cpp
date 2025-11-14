@@ -110,6 +110,25 @@ std::string DLSSConfig::GetDocumentsConfigPath() {
     return pathNoSpace;
 }
 
+void DLSSConfig::ForceDisableEarlyDlss(const char* reason) {
+    const bool wasEnabled = earlyDlssEnabled;
+    const bool wasModeNonZero = (earlyDlssMode != 0);
+    if (!wasEnabled && !wasModeNonZero) {
+        return;
+    }
+
+    earlyDlssEnabled = false;
+    earlyDlssMode = 0;
+
+    if (wasEnabled || wasModeNonZero) {
+        if (reason && reason[0] != '\0') {
+            _MESSAGE("Early DLSS forcibly disabled (%s)", reason);
+        } else {
+            _MESSAGE("Early DLSS forcibly disabled (runtime override)");
+        }
+    }
+}
+
 namespace {
     std::wstring GetThisModuleDir() {
         HMODULE hModule = nullptr;
@@ -207,6 +226,7 @@ void DLSSConfig::Load() {
     }
 
     ParseIniFile(configPath);
+    ForceDisableEarlyDlss("VR stability override");
     if (shouldPersistToDocs) {
         // Copy current in-memory settings to Documents to avoid future ambiguity
         Save();
@@ -294,6 +314,14 @@ void DLSSConfig::ParseIniFile(const std::string& path) {
         if (lowerSection == "settings") {
             if (normalizedKey == "enableupscaler") {
                 enableUpscaler = StringToBool(value);
+            } else if (normalizedKey == "backend" || normalizedKey == "slonly") {
+                // mBackend = SL|NGX  OR  mSLOnly = true/false
+                std::string v = ToLower(value);
+                if (normalizedKey == "backend") {
+                    streamlineOnly = (v == "sl" || v == "streamline");
+                } else {
+                    streamlineOnly = StringToBool(value);
+                }
             } else if (normalizedKey == "upscaletype" || normalizedKey == "upscalertype") {
                 int type = ClampValue(ParseInt(value), 0, 3);
                 upscalerType = static_cast<UpscalerType>(type);
@@ -386,6 +414,10 @@ void DLSSConfig::ParseIniFile(const std::string& path) {
             } else if (normalizedKey == "enablereflex") {
                 enableReflex = StringToBool(value);
             }
+        } else if (lowerSection == "settings") {
+            if (normalizedKey == "submitcopyenabled") {
+                submitCopyEnabled = StringToBool(value);
+            }
         } else if (lowerSection == "hotkeys") {
             if (normalizedKey == "togglemenu") {
                 toggleMenuKey = NormalizeHotkeyValue(ParseInt(value));
@@ -404,22 +436,28 @@ void DLSSConfig::ParseIniFile(const std::string& path) {
 }
 
 void DLSSConfig::Save() {
-    std::string configPath = DLSSConfig::GetDocumentsConfigPath();
+    ForceDisableEarlyDlss("config save");
+    // Always prefer the no-space folder (Fallout4VR), but keep the with-space variant in sync if present
+    char docs[MAX_PATH] = {};
+    SHGetFolderPathA(NULL, CSIDL_MYDOCUMENTS, NULL, 0, docs);
+    const std::string base = docs;
+    const std::string pathNoSpace = base + "\\My Games\\Fallout4VR\\F4SE\\Plugins\\F4SEVR_DLSS.ini";
+    const std::string pathWithSpace = base + "\\My Games\\Fallout 4 VR\\F4SE\\Plugins\\F4SEVR_DLSS.ini";
 
-    // Ensure nested directories exist (F4SE\Plugins under Documents)
-    std::string directory;
-    const size_t delimiter = configPath.find_last_of("/\\");
-    if (delimiter != std::string::npos) {
-        directory = configPath.substr(0, delimiter);
-        if (!directory.empty()) {
-            // Create full tree (CreateDirectoryA creates only leaf)
-            SHCreateDirectoryExA(NULL, directory.c_str(), NULL);
+    auto ensureDir = [](const std::string& filePath) {
+        std::string dir = filePath;
+        size_t pos = dir.find_last_of("/\\");
+        if (pos != std::string::npos) {
+            dir = dir.substr(0, pos);
+            if (!dir.empty()) SHCreateDirectoryExA(NULL, dir.c_str(), NULL);
         }
-    }
+    };
 
-    std::ofstream file(configPath);
+    // Primary write: no-space variant
+    ensureDir(pathNoSpace);
+    std::ofstream file(pathNoSpace);
     if (!file.is_open()) {
-        _ERROR("Failed to save config file");
+        _ERROR("Failed to save config file at preferred path (no-space)");
         return;
     }
 
@@ -430,6 +468,7 @@ void DLSSConfig::Save() {
 
     file << "[Settings]" << std::endl;
     file << "mEnableUpscaler = " << boolToString(enableUpscaler) << std::endl;
+    file << "mBackend = " << (streamlineOnly ? "SL" : "NGX") << std::endl;
     file << "mUpscalerType = " << static_cast<int>(upscalerType) << std::endl;
     file << "mQualityLevel = " << static_cast<int>(quality) << std::endl;
     file << "mSharpening = " << boolToString(enableSharpening) << std::endl;
@@ -486,7 +525,73 @@ void DLSSConfig::Save() {
     file << "mCycleUpscaler = " << FormatVirtualKey(cycleUpscalerKey) << std::endl;
 
     file.close();
-    _MESSAGE("Config saved to: %s", configPath.c_str());
+    _MESSAGE("Config saved to: %s", pathNoSpace.c_str());
+
+    // Secondary write (keep with-space in sync if it already exists)
+    const DWORD attrWith = GetFileAttributesA(pathWithSpace.c_str());
+    const std::string dirWith = base + "\\My Games\\Fallout 4 VR\\F4SE\\Plugins\\";
+    const DWORD dirWithAttr = GetFileAttributesA(dirWith.c_str());
+    if (attrWith != INVALID_FILE_ATTRIBUTES || dirWithAttr != INVALID_FILE_ATTRIBUTES) {
+        ensureDir(pathWithSpace);
+        std::ofstream file2(pathWithSpace);
+        if (file2.is_open()) {
+            // Reuse the same serialization
+            auto boolToString = [](bool value) { return value ? "true" : "false"; };
+            file2 << "; F4SEVR DLSS Plugin Configuration" << std::endl;
+            file2 << "; Bu dosya otomatik olusturuldu. ImGui menusu ile uyumludur." << std::endl << std::endl;
+            file2 << "[Settings]" << std::endl;
+            file2 << "mEnableUpscaler = " << boolToString(enableUpscaler) << std::endl;
+            file2 << "mBackend = " << (streamlineOnly ? "SL" : "NGX") << std::endl;
+            file2 << "mUpscalerType = " << static_cast<int>(upscalerType) << std::endl;
+            file2 << "mQualityLevel = " << static_cast<int>(quality) << std::endl;
+            file2 << "mSharpening = " << boolToString(enableSharpening) << std::endl;
+            file2 << "mSharpness = " << sharpness << std::endl;
+            file2 << "mUseOptimalMipLodBias = " << boolToString(useOptimalMipLodBias) << std::endl;
+            file2 << "mMipLodBias = " << mipLodBias << std::endl;
+            file2 << "mRenderReShadeBeforeUpscaling = " << boolToString(renderReShadeBeforeUpscaling) << std::endl;
+            file2 << "mUpscaleDepthForReShade = " << boolToString(upscaleDepthForReShade) << std::endl;
+            file2 << "mUseTAAForPeriphery = " << boolToString(useTAAForPeriphery) << std::endl;
+            file2 << "mEarlyDlssEnabled = " << boolToString(earlyDlssEnabled) << std::endl;
+            file2 << "mEarlyDlssMode = " << earlyDlssMode << std::endl;
+            file2 << "mPeripheryTAAEnabled = " << boolToString(peripheryTAAEnabled) << std::endl;
+            file2 << "mFoveatedRenderingEnabled = " << boolToString(foveatedRenderingEnabled) << std::endl;
+            file2 << "mDebugEarlyDlss = " << boolToString(debugEarlyDlss) << std::endl;
+            file2 << "mEnablePerEyeCap = " << boolToString(enablePerEyeCap) << std::endl;
+            file2 << "mPerEyeMaxDim = " << perEyeMaxDim << std::endl;
+            file2 << "mHighQualityComposite = " << boolToString(highQualityComposite) << std::endl;
+            file2 << "mDLSSPreset = " << dlssPreset << std::endl;
+            file2 << "mFOV = " << fov << std::endl << std::endl;
+            file2 << "; ImGui menusu icin UI olcegi (0.5 - 3.0). VR icin 1.5 uygun" << std::endl;
+            file2 << "mUIScale = " << uiScale << std::endl << std::endl;
+            file2 << "[DLSS4]" << std::endl;
+            file2 << "mEnableTransformerModel = " << boolToString(enableTransformerModel) << std::endl;
+            file2 << "mEnableRayReconstruction = " << boolToString(enableRayReconstruction) << std::endl << std::endl;
+            file2 << "[FixedFoveatedUpscaling]" << std::endl;
+            file2 << "mEnableFixedFoveatedUpscaling = " << boolToString(enableFixedFoveatedUpscaling) << std::endl;
+            file2 << "mFoveatedScaleX = " << foveatedScaleX << std::endl;
+            file2 << "mFoveatedScaleY = " << foveatedScaleY << std::endl;
+            file2 << "mFoveatedOffsetX = " << foveatedOffsetX << std::endl;
+            file2 << "mFoveatedOffsetY = " << foveatedOffsetY << std::endl << std::endl;
+            file2 << "[FixedFoveatedRendering]" << std::endl;
+            file2 << "mEnableFixedFoveatedRendering = " << boolToString(enableFixedFoveatedRendering) << std::endl;
+            file2 << "mInnerRadius = " << foveatedInnerRadius << std::endl;
+            file2 << "mMiddleRadius = " << foveatedMiddleRadius << std::endl;
+            file2 << "mOuterRadius = " << foveatedOuterRadius << std::endl;
+            file2 << "mCutoutRadius = " << foveatedCutoutRadius << std::endl;
+            file2 << "mWiden = " << foveatedWiden << std::endl << std::endl;
+            file2 << "[Performance]" << std::endl;
+            file2 << "mEnableLowLatencyMode = " << boolToString(enableLowLatencyMode) << std::endl;
+            file2 << "mEnableReflex = " << boolToString(enableReflex) << std::endl << std::endl;
+            file2 << "[Hotkeys]" << std::endl;
+            file2 << "; Virtual-key codes. See: https://learn.microsoft.com/windows/win32/inputdev/virtual-key-codes" << std::endl;
+            file2 << "mToggleMenu = " << FormatVirtualKey(toggleMenuKey) << std::endl;
+            file2 << "mToggleUpscaler = " << FormatVirtualKey(toggleUpscalerKey) << std::endl;
+            file2 << "mCycleQuality = " << FormatVirtualKey(cycleQualityKey) << std::endl;
+            file2 << "mCycleUpscaler = " << FormatVirtualKey(cycleUpscalerKey) << std::endl;
+            file2.close();
+            _MESSAGE("Config mirrored to: %s", pathWithSpace.c_str());
+        }
+    }
 }
 
 

@@ -88,6 +88,12 @@ private:
         // Render-size color (downscaled from eye input) used as DLSS input
         ID3D11Texture2D* renderColor = nullptr;
         ID3D11RenderTargetView* renderColorRTV = nullptr;
+        ID3D11Texture2D* renderDepth = nullptr;
+        ID3D11RenderTargetView* renderDepthRTV = nullptr;
+        ID3D11ShaderResourceView* renderDepthSRV = nullptr;
+        ID3D11Texture2D* renderMotion = nullptr;
+        ID3D11RenderTargetView* renderMotionRTV = nullptr;
+        ID3D11ShaderResourceView* renderMotionSRV = nullptr;
         uint32_t renderWidth = 0;
         uint32_t renderHeight = 0;
         uint32_t outputWidth = 0;
@@ -108,17 +114,23 @@ private:
     bool EnsureZeroDepthTexture(uint32_t width, uint32_t height);
     void ReleaseZeroDepthTexture();
     void ReleaseEyeRender(EyeContext& eye);
+    void ReleaseEyeAuxiliary(EyeContext& eye);
     bool EnsureDownscaleShaders();
     // Downscale/crop inputTexture into eye.renderColor at renderWidth/renderHeight.
     // UV window selects a sub-rectangle of the source: uv = offset + uv * scale.
-    bool DownscaleToRender(EyeContext& eye,
-                           ID3D11Texture2D* inputTexture,
+    bool DownscaleToRender(ID3D11Texture2D*& targetTexture,
+                           ID3D11RenderTargetView*& targetRTV,
+                           DXGI_FORMAT targetFormat,
+                           ID3D11Texture2D* sourceTexture,
                            uint32_t renderWidth,
                            uint32_t renderHeight,
                            float uvOffsetX,
                            float uvOffsetY,
                            float uvScaleX,
-                           float uvScaleY);
+                           float uvScaleY,
+                           bool* outTextureRecreated = nullptr,
+                           ID3D11ShaderResourceView** outTargetSRV = nullptr,
+                           const char* debugLabel = "resample");
 
     EyeContext m_leftEye;
     EyeContext m_rightEye;

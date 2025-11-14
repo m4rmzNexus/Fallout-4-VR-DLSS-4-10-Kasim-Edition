@@ -24,6 +24,27 @@
 extern DLSSManager* g_dlssManager;
 extern DLSSConfig* g_dlssConfig;
 
+namespace {
+    inline bool DlssTraceEnabled() {
+        return g_dlssConfig && g_dlssConfig->debugEarlyDlss;
+    }
+
+    inline bool DlssTraceSampled(uint32_t modulo) {
+        if (!DlssTraceEnabled() || modulo == 0) {
+            return false;
+        }
+        static std::atomic<uint32_t> s_traceCounter{0};
+        return (s_traceCounter.fetch_add(1, std::memory_order_relaxed) % modulo) == 0;
+    }
+
+    inline bool IsEarlyDlssActive() {
+        return g_dlssConfig && g_dlssConfig->earlyDlssEnabled;
+    }
+}
+
+#define DLSS_TRACE(fmt, ...)            do { if (DlssTraceEnabled()) _MESSAGE("[DLSS_TRACE] " fmt, __VA_ARGS__); } while (0)
+#define DLSS_TRACE_SAMPLED(mod, fmt, ...) do { if (DlssTraceSampled(mod)) _MESSAGE("[DLSS_TRACE] " fmt, __VA_ARGS__); } while (0)
+
 extern "C" {
     bool InitializeImGuiMenu();
     void RenderImGuiMenu();
@@ -196,9 +217,14 @@ namespace DLSSHooks {
     PFN_ResizeBuffers RealResizeBuffers = nullptr;
     PFN_CreateTexture2D RealCreateTexture2D = nullptr;
     PFN_CreateDeferredContext RealCreateDeferredContext = nullptr;
+    PFN_CreateSamplerState RealCreateSamplerState = nullptr;
     PFN_FactoryCreateSwapChain RealFactoryCreateSwapChain = nullptr;
     PFN_RSSetViewports RealRSSetViewports = nullptr;
     PFN_OMSetRenderTargets RealOMSetRenderTargets = nullptr;
+
+    // Forward declarations for helpers defined later in this file
+    static bool IsLikelyVRSceneRT(const D3D11_TEXTURE2D_DESC& d);
+    static bool ApproxEqUINT(UINT a, UINT b, float relTol = 0.1f);
 
     static void InitializeImGuiBackend(IDXGISwapChain* swapChain) {
         if (g_imguiBackendInitialized || !swapChain || !g_device || !g_context) {
@@ -395,8 +421,39 @@ HRESULT WINAPI HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT
             g_state.store(DlssState::HaveSwapChain, std::memory_order_relaxed);
         }
 
+        // Clamp mirror/backbuffer size against HMD per-eye recommendation (PureDark-style)
+        UINT clampedW = Width;
+        UINT clampedH = Height;
+        {
+            uint32_t recW = 0, recH = 0;
+            if (HMODULE openVRModule = GetModuleHandleW(L"openvr_api.dll")) {
+                using PFN_VR_GetGenericInterface = void* (VR_CALLTYPE*)(const char*, vr::EVRInitError*);
+                if (auto getIface = reinterpret_cast<PFN_VR_GetGenericInterface>(GetProcAddress(openVRModule, "VR_GetGenericInterface"))) {
+                    vr::EVRInitError err = vr::VRInitError_None;
+                    void* ptr = getIface(vr::IVRSystem_Version, &err);
+                    if (ptr && err == vr::VRInitError_None) {
+                        auto sys = reinterpret_cast<vr::IVRSystem*>(ptr);
+                        uint32_t w=0,h=0; sys->GetRecommendedRenderTargetSize(&w, &h);
+                        recW = w; recH = h;
+                    }
+                }
+            }
+            if (recW > 0 && recH > 0) {
+                const UINT maxW = recW * 2u;
+                const UINT maxH = recH;
+                UINT newW = clampedW;
+                UINT newH = clampedH;
+                if (newW > maxW) newW = maxW;
+                if (newH > maxH) newH = maxH;
+                if (newW != clampedW || newH != clampedH) {
+                    _MESSAGE("[MirrorClamp] ResizeBuffers %ux%u -> %ux%u (max %ux%u)", clampedW, clampedH, newW, newH, maxW, maxH);
+                    clampedW = newW; clampedH = newH;
+                }
+            }
+        }
+
         HRESULT result = RealResizeBuffers
-            ? RealResizeBuffers(pSwapChain, BufferCount, Width, Height, NewFormat, SwapChainFlags)
+            ? RealResizeBuffers(pSwapChain, BufferCount, clampedW, clampedH, NewFormat, SwapChainFlags)
             : DXGI_ERROR_INVALID_CALL;
 
         if (SUCCEEDED(result)) {
@@ -414,6 +471,19 @@ HRESULT WINAPI HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT
         return result;
     }
 
+    static void UnbindResourcesForSubmit() {
+        if (!g_context) {
+            return;
+        }
+        ID3D11UnorderedAccessView* nullUAV[8] = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+        UINT counts[8] = { 0,0,0,0,0,0,0,0 };
+        g_context->CSSetUnorderedAccessViews(0, 8, nullUAV, counts);
+        ID3D11ShaderResourceView* nullSRV[8] = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+        g_context->PSSetShaderResources(0, 8, nullSRV);
+        ID3D11SamplerState* nullSamp[4] = { nullptr, nullptr, nullptr, nullptr };
+        g_context->PSSetSamplers(0, 4, nullSamp);
+    }
+
     void ProcessVREyeTexture(ID3D11Texture2D* eyeTexture, bool isLeftEye) {
         if (!g_dlssManager || !g_dlssManager->IsEnabled() || !g_dlssRuntimeInitialized) {
             return;
@@ -422,6 +492,9 @@ HRESULT WINAPI HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT
         if (!eyeTexture) {
             return;
         }
+
+        DLSS_TRACE_SAMPLED(60, "ProcessVREyeTexture eye=%d eyeTex=%p depth=%p mv=%p",
+                           isLeftEye ? 0 : 1, eyeTexture, g_fallbackDepthTexture, g_motionVectorTexture);
 
         ID3D11Texture2D* upscaledTexture = nullptr;
         ID3D11Texture2D* depthTexture = g_fallbackDepthTexture;
@@ -433,22 +506,83 @@ HRESULT WINAPI HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT
             upscaledTexture = g_dlssManager->ProcessRightEye(eyeTexture, depthTexture, motionVectors);
         }
 
-        (void)upscaledTexture;
+        if (upscaledTexture && eyeTexture && g_context && upscaledTexture != eyeTexture) {
+            D3D11_TEXTURE2D_DESC srcDesc{}; upscaledTexture->GetDesc(&srcDesc);
+            D3D11_TEXTURE2D_DESC dstDesc{}; eyeTexture->GetDesc(&dstDesc);
+            const bool fmtMatch = (srcDesc.Format == dstDesc.Format) &&
+                                  (srcDesc.SampleDesc.Count == dstDesc.SampleDesc.Count) &&
+                                  (srcDesc.SampleDesc.Count <= 1);
+            if (fmtMatch) {
+                UINT copyW = std::min(srcDesc.Width, dstDesc.Width);
+                UINT copyH = std::min(srcDesc.Height, dstDesc.Height);
+                if (copyW > 0 && copyH > 0) {
+                    D3D11_BOX src{};
+                    src.left = 0; src.top = 0; src.front = 0;
+                    src.right = copyW; src.bottom = copyH; src.back = 1;
+                    UnbindResourcesForSubmit();
+                    g_context->CopySubresourceRegion(eyeTexture, 0, 0, 0, 0, upscaledTexture, 0, &src);
+                    DLSS_TRACE_SAMPLED(60, "ProcessVREyeTexture copy eye=%d %ux%u -> %ux%u (src=%p dst=%p)",
+                                       isLeftEye ? 0 : 1, copyW, copyH, dstDesc.Width, dstDesc.Height,
+                                       upscaledTexture, eyeTexture);
+                }
+            } else {
+                _MESSAGE("[VRSubmit] Skip direct copy: fmt/msaa mismatch srcFmt=%u dstFmt=%u srcS=%u dstS=%u",
+                         (unsigned)srcDesc.Format, (unsigned)dstDesc.Format,
+                         (unsigned)srcDesc.SampleDesc.Count, (unsigned)dstDesc.SampleDesc.Count);
+            }
+        } else if (DlssTraceSampled(60)) {
+            _MESSAGE("[DLSS_TRACE] ProcessVREyeTexture skip copy eye=%d reason=%s (src=%p dst=%p)",
+                     isLeftEye ? 0 : 1,
+                     (!upscaledTexture || !eyeTexture) ? "null" :
+                     (upscaledTexture == eyeTexture ? "same-texture" : "missing-context"),
+                     upscaledTexture, eyeTexture);
+        }
     }
 
-    void RegisterMotionVectorTexture(ID3D11Texture2D* motionTexture) {
+    void RegisterMotionVectorTexture(ID3D11Texture2D* motionTexture,
+                                     const D3D11_TEXTURE2D_DESC* desc,
+                                     UINT targetWidth,
+                                     UINT targetHeight) {
         static bool logged = false;
+        static UINT cachedWidth = 0;
+        static UINT cachedHeight = 0;
+
+        if (!motionTexture) {
+            SafeAssignTexture(g_motionVectorTexture, nullptr);
+            cachedWidth = cachedHeight = 0;
+            if (logged) {
+                _MESSAGE("Motion vector texture cleared for DLSS");
+                logged = false;
+            }
+            return;
+        }
+
+        D3D11_TEXTURE2D_DESC localDesc{};
+        const D3D11_TEXTURE2D_DESC* useDesc = desc;
+        if (!useDesc) {
+            motionTexture->GetDesc(&localDesc);
+            useDesc = &localDesc;
+        }
+
+        const bool matchesTarget = (targetWidth > 0 && targetHeight > 0 &&
+                                    useDesc->Width == targetWidth &&
+                                    useDesc->Height == targetHeight);
+        const bool matchesCached = (cachedWidth == useDesc->Width && cachedHeight == useDesc->Height);
+        if (!matchesTarget && matchesCached) {
+            // stale resolution, ignore
+            return;
+        }
 
         SafeAssignTexture(g_motionVectorTexture, motionTexture);
+        cachedWidth = useDesc->Width;
+        cachedHeight = useDesc->Height;
 
         if (motionTexture) {
             if (!logged) {
                 _MESSAGE("Motion vector texture registered for DLSS");
                 logged = true;
             }
-        } else if (logged) {
-            _MESSAGE("Motion vector texture cleared for DLSS");
-            logged = false;
+            _MESSAGE("Registered motion vectors: %ux%u fmt=%u", useDesc->Width, useDesc->Height, (unsigned)useDesc->Format);
         }
     }
 
@@ -457,14 +591,12 @@ HRESULT WINAPI HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT
                                       UINT targetWidth,
                                       UINT targetHeight) {
         static bool logged = false;
-        static float bestScore = std::numeric_limits<float>::max();
-        static UINT bestWidth = 0;
-        static UINT bestHeight = 0;
+        static UINT cachedWidth = 0;
+        static UINT cachedHeight = 0;
 
         if (!depthTexture) {
             SafeAssignTexture(g_fallbackDepthTexture, nullptr);
-            bestScore = std::numeric_limits<float>::max();
-            bestWidth = bestHeight = 0;
+            cachedWidth = cachedHeight = 0;
             if (logged) {
                 _MESSAGE("Fallback depth texture cleared for DLSS");
                 logged = false;
@@ -479,25 +611,23 @@ HRESULT WINAPI HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT
             resolvedDesc = &localDesc;
         }
 
-        const float idealRatio = 0.66f;
-        float widthRatio = targetWidth ? static_cast<float>(resolvedDesc->Width) / static_cast<float>(targetWidth) : idealRatio;
-        float score = std::fabs(widthRatio - idealRatio);
-
-        if (score > bestScore + 0.05f) {
+        const bool matchesTarget = (targetWidth > 0 && targetHeight > 0 &&
+                                    resolvedDesc->Width == targetWidth &&
+                                    resolvedDesc->Height == targetHeight);
+        const bool matchesCached = (cachedWidth == resolvedDesc->Width && cachedHeight == resolvedDesc->Height);
+        if (!matchesTarget && matchesCached) {
             return;
         }
 
-        if (score < bestScore - 0.05f || resolvedDesc->Width > bestWidth) {
-            SafeAssignTexture(g_fallbackDepthTexture, depthTexture);
-            bestScore = score;
-            bestWidth = resolvedDesc->Width;
-            bestHeight = resolvedDesc->Height;
-            if (!logged) {
-                _MESSAGE("Fallback depth texture registered for DLSS");
-                logged = true;
-            }
-            _MESSAGE("Registered fallback depth: %ux%u fmt=%u", resolvedDesc->Width, resolvedDesc->Height, (unsigned)resolvedDesc->Format);
+        SafeAssignTexture(g_fallbackDepthTexture, depthTexture);
+        cachedWidth = resolvedDesc->Width;
+        cachedHeight = resolvedDesc->Height;
+
+        if (!logged) {
+            _MESSAGE("Fallback depth texture registered for DLSS");
+            logged = true;
         }
+        _MESSAGE("Registered fallback depth: %ux%u fmt=%u", resolvedDesc->Width, resolvedDesc->Height, (unsigned)resolvedDesc->Format);
     }
 
     bool GetD3D11Device(ID3D11Device** ppDevice, ID3D11DeviceContext** ppContext) {
@@ -528,13 +658,45 @@ namespace {
         const vr::Texture_t*,
         const vr::VRTextureBounds_t*,
         vr::EVRSubmitFlags);
+    using VRSubmitWithArrayIndexFn = vr::EVRCompositorError(VR_CALLTYPE*)(
+        void* /*this*/,
+        vr::EVREye,
+        const vr::Texture_t*,
+        uint32_t /*unTextureArrayIndex*/,
+        const vr::VRTextureBounds_t*,
+        vr::EVRSubmitFlags);
 
     VRSubmitFn g_realVRSubmit = nullptr;
+    VRSubmitWithArrayIndexFn g_realVRSubmitWithArrayIndex = nullptr;
     bool g_vrSubmitHookInstalled = false;
     bool g_loggedSubmitFailure = false;
     // Per-eye display (output) sizes tracked from Submit bounds
     static std::atomic<uint32_t> g_perEyeOutW[2] = {0,0};
     static std::atomic<uint32_t> g_perEyeOutH[2] = {0,0};
+
+    // Atlas for SxS replacement (to preserve original bounds semantics)
+    static ID3D11Texture2D* g_submitAtlasTex = nullptr;
+    static UINT g_submitAtlasW = 0, g_submitAtlasH = 0;
+
+    static bool EnsureSubmitAtlas(UINT width, UINT height, DXGI_FORMAT fmt = DXGI_FORMAT_B8G8R8A8_UNORM) {
+        if (!g_device || !width || !height) return false;
+        if (g_submitAtlasTex && g_submitAtlasW == width && g_submitAtlasH == height) {
+            return true;
+        }
+        if (g_submitAtlasTex) { g_submitAtlasTex->Release(); g_submitAtlasTex = nullptr; }
+        D3D11_TEXTURE2D_DESC d{};
+        d.Width = width; d.Height = height; d.MipLevels = 1; d.ArraySize = 1;
+        d.Format = fmt; d.SampleDesc.Count = 1; d.SampleDesc.Quality = 0;
+        d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        d.CPUAccessFlags = 0; d.MiscFlags = 0;
+        ID3D11Texture2D* tex = nullptr;
+        if (FAILED(g_device->CreateTexture2D(&d, nullptr, &tex)) || !tex) {
+            return false;
+        }
+        g_submitAtlasTex = tex;
+        g_submitAtlasW = width; g_submitAtlasH = height;
+        return true;
+    }
 
     ID3D11Texture2D* ExtractColorTexture(const vr::Texture_t* texture) {
         if (!texture || !texture->handle) {
@@ -579,35 +741,18 @@ namespace {
         }
 
         EnsureGlobalInstances();
+        const bool earlyActive = IsEarlyDlssActive();
+        DLSS_TRACE_SAMPLED(120,
+                           "Submit eye=%d handle=%p flags=0x%X bounds=[%.2f %.2f %.2f %.2f]",
+                           (int)eye,
+                           texture ? texture->handle : nullptr,
+                           (unsigned)flags,
+                           bounds ? bounds->uMin : 0.0f,
+                           bounds ? bounds->vMin : 0.0f,
+                           bounds ? bounds->uMax : 0.0f,
+                           bounds ? bounds->vMax : 0.0f);
 
-        ID3D11Texture2D* colorTexture = ExtractColorTexture(texture);
-        ID3D11Texture2D* depthTexture = ExtractDepthTexture(texture, flags);
-        if (!depthTexture) {
-            depthTexture = g_fallbackDepthTexture;
-        }
-
-        ID3D11Texture2D* motionVectors = g_motionVectorTexture;
-        ID3D11Texture2D* processedTexture = nullptr;        // Prefer small redirected RT as DLSS input if available
-        if (colorTexture && g_dlssConfig && g_dlssConfig->earlyDlssEnabled && g_dlssConfig->earlyDlssMode == 1) {
-            ID3D11Texture2D* candidateSmall = nullptr;
-            {
-                std::lock_guard<std::mutex> lock(g_redirectMutex);
-                // Look up by big color texture key
-                auto it = g_redirectMap.find(colorTexture);
-                if (it != g_redirectMap.end() && it->second.smallTex) {
-                    candidateSmall = it->second.smallTex;
-                    if (g_dlssConfig->debugEarlyDlss) {
-                        _MESSAGE("[EarlyDLSS][Submit] Using small RT as DLSS input");
-                    }
-                }
-            }
-            if (candidateSmall) {
-                colorTexture = candidateSmall;
-            }
-        }
-        const bool dlssReady = EnsureDLSSRuntimeReady();
-
-        // Track per-eye display size using OpenVR recommended target size (more stable than texture size)
+        // Track per-eye display size using OpenVR recommended target size
         {
             uint32_t recW = 0, recH = 0;
             // Try to get IVRSystem via VR_GetGenericInterface without a direct import
@@ -625,6 +770,7 @@ namespace {
             }
             // Fallback: derive from submitted texture bounds if VRSystem not available yet
             if (recW == 0 || recH == 0) {
+                ID3D11Texture2D* colorTexture = ExtractColorTexture(texture);
                 if (colorTexture) {
                     D3D11_TEXTURE2D_DESC eyeDesc{}; colorTexture->GetDesc(&eyeDesc);
                     uint32_t fullW = eyeDesc.Width;
@@ -661,7 +807,7 @@ namespace {
             // even-align
             recW &= ~1u; recH &= ~1u;
             // Optional per-eye cap to keep sizes sane
-            if (g_dlssConfig && g_dlssConfig->enablePerEyeCap && g_dlssConfig->perEyeMaxDim > 0) {
+            if (earlyActive && g_dlssConfig && g_dlssConfig->enablePerEyeCap && g_dlssConfig->perEyeMaxDim > 0) {
                 const uint32_t cap = (uint32_t)g_dlssConfig->perEyeMaxDim;
                 uint32_t maxDim = recW > recH ? recW : recH;
                 if (maxDim > cap && maxDim > 0) {
@@ -687,7 +833,7 @@ namespace {
             // based on current DLSS quality and per-eye output, without changing behavior.
             static uint64_t s_dbgCounter = 0;
             ++s_dbgCounter;
-            if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
+            if (earlyActive && g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
                 // Log at a low rate to avoid spam
                 if ((s_dbgCounter % 300) == 1) {
                     uint32_t prW = 0, prH = 0;
@@ -702,122 +848,218 @@ namespace {
             }
         }
 
-        if (colorTexture && dlssReady) {
-            const bool isLeftEye = (eye == vr::Eye_Left);
-            processedTexture = isLeftEye
-                ? g_dlssManager->ProcessLeftEye(colorTexture, depthTexture, motionVectors)
-                : g_dlssManager->ProcessRightEye(colorTexture, depthTexture, motionVectors);
-            // Track per-eye result for readiness state machine
-            const int idx = (eye == vr::Eye_Left) ? 0 : 1;
-            if (processedTexture && processedTexture != colorTexture) {
-                g_upscaledEyeTex[idx] = processedTexture;
-                g_lastEvaluateOk.store(true, std::memory_order_relaxed);
-                if (g_state.load(std::memory_order_relaxed) != DlssState::Ready) {
-                    g_state.store(DlssState::Ready, std::memory_order_relaxed);
-                }
-            } else {
-                g_upscaledEyeTex[idx] = nullptr;
-                g_lastEvaluateOk.store(false, std::memory_order_relaxed);
-            }
-        }
-
-        // One-time debug: confirm what we submit to compositor
-        static int s_submitLogCount = 0;
-        if (s_submitLogCount < 2) {
-            D3D11_TEXTURE2D_DESC inDesc{}; if (colorTexture) colorTexture->GetDesc(&inDesc);
-            D3D11_TEXTURE2D_DESC outDesc{}; if (processedTexture) processedTexture->GetDesc(&outDesc);
-            const bool usedDLSS = processedTexture && processedTexture != colorTexture;
-            _MESSAGE("[DLSS][DBG] OnSubmit(eye=%s) in=%ux%u out=%ux%u used=%s flags=0x%X cs=%d",
-                (eye==vr::Eye_Left?"L":"R"),
-                inDesc.Width, inDesc.Height,
-                usedDLSS ? outDesc.Width : inDesc.Width,
-                usedDLSS ? outDesc.Height : inDesc.Height,
-                usedDLSS ? "DLSS" : "Native",
-                (unsigned)flags,
-                (int)(texture?texture->eColorSpace:0));
-            ++s_submitLogCount;
-        }
-
-        // Guard: only submit DLSS output when fully ready and output is valid
-        bool canUseUpscaled = (g_state.load(std::memory_order_relaxed) == DlssState::Ready) &&
-                              g_lastEvaluateOk.load(std::memory_order_relaxed) &&
-                              processedTexture && (processedTexture != colorTexture);
-
-        // Validate sample count for processed texture; allow different dimensions
-        if (canUseUpscaled) {
-            D3D11_TEXTURE2D_DESC outDesc{}; processedTexture->GetDesc(&outDesc);
-            if (outDesc.SampleDesc.Count != 1) {
-                canUseUpscaled = false;
-            }
-        }
-
-        if (canUseUpscaled) {
-            // Prefer safest path: keep original texture handle for VR compositor and copy/blit DLSS result into it
-            D3D11_TEXTURE2D_DESC inDesc{}; colorTexture->GetDesc(&inDesc);
-            D3D11_TEXTURE2D_DESC outDesc{}; processedTexture->GetDesc(&outDesc);
-
-            bool submitted = false;
-            bool copied = false;
-            do {
-                // Fast path: exact match copy
-                if (inDesc.Width == outDesc.Width && inDesc.Height == outDesc.Height && inDesc.Format == outDesc.Format) {
-                    if (g_device && g_context) {
-                        g_context->CopyResource(colorTexture, processedTexture);
-                        _MESSAGE("[DLSS][Submit] Copied DLSS output into original eye texture (CopyResource)");
-                        copied = true;
+        // Submit path: perform per-eye DLSS evaluate and copy back into submitted texture region
+        // so the compositor displays the upscaled result without handle replacement.
+        if (EnsureDLSSRuntimeReady()) {
+            ID3D11Texture2D* colorTexture = ExtractColorTexture(texture);
+            if (colorTexture && g_device && g_context && g_dlssManager && g_dlssManager->IsEnabled()) {
+                // Determine per-eye output recommended size (recW/recH from the block above)
+                uint32_t outW = 0, outH = 0;
+                (void)DLSSHooks::GetPerEyeDisplaySize(eye == vr::Eye_Left ? 0 : 1, outW, outH);
+                if (outW == 0 || outH == 0) {
+                    // Fallback from submitted texture bounds
+                    D3D11_TEXTURE2D_DESC eyeDesc{}; colorTexture->GetDesc(&eyeDesc);
+                    uint32_t fullW = eyeDesc.Width;
+                    uint32_t fullH = eyeDesc.Height;
+                    double uSpan = 1.0, vSpan = 1.0;
+                    if (bounds) {
+                        uSpan = std::max(0.0, std::min(1.0, (double)bounds->uMax - (double)bounds->uMin));
+                        vSpan = std::max(0.0, std::min(1.0, (double)bounds->vMax - (double)bounds->vMin));
                     }
+                    outW = (uint32_t)std::max(1.0, uSpan * (double)fullW);
+                    outH = (uint32_t)std::max(1.0, vSpan * (double)fullH);
+                    if ((uSpan > 0.99 && vSpan > 0.99) || !bounds) {
+                        if (fullW >= (uint32_t)((double)fullH * 1.7)) { outW = fullW / 2u; outH = fullH; }
+                        else if (fullH >= (uint32_t)((double)fullW * 1.7)) { outW = fullW; outH = fullH / 2u; }
+                    }
+                    outW &= ~1u; outH &= ~1u;
                 }
-                if (!copied && g_dlssManager && g_device) {
-                    // Try linear blit into original using an RTV on the original eye texture
-                    ID3D11RenderTargetView* rtv = nullptr;
-                    if (SUCCEEDED(g_device->CreateRenderTargetView(colorTexture, nullptr, &rtv)) && rtv) {
-                        if (g_dlssManager->BlitToRTV(processedTexture, rtv, inDesc.Width, inDesc.Height)) {
-                            _MESSAGE("[DLSS][Submit] Copied DLSS output into original eye texture (Blit)");
-                            copied = true;
+
+                // Process eye via DLSS
+                ID3D11Texture2D* up = (eye == vr::Eye_Left)
+                    ? g_dlssManager->ProcessLeftEye(colorTexture, g_fallbackDepthTexture, g_motionVectorTexture)
+                    : g_dlssManager->ProcessRightEye(colorTexture, g_fallbackDepthTexture, g_motionVectorTexture);
+                DLSS_TRACE_SAMPLED(120,
+                                   "Submit eye=%d dlssIn=%p dlssOut=%p perEyeOut=%ux%u",
+                                   (int)eye, colorTexture, up, outW, outH);
+                if (up && up != colorTexture) {
+                    // Compute destination region from bounds (or infer atlas half)
+                    D3D11_TEXTURE2D_DESC dstDesc{}; colorTexture->GetDesc(&dstDesc);
+                    UINT dstX = 0, dstY = 0;
+                    UINT dstW = outW ? outW : dstDesc.Width;
+                    UINT dstH = outH ? outH : dstDesc.Height;
+                    if (bounds) {
+                        const double uMin = std::max(0.0, std::min(1.0, (double)bounds->uMin));
+                        const double vMin = std::max(0.0, std::min(1.0, (double)bounds->vMin));
+                        const double uMax = std::max(0.0, std::min(1.0, (double)bounds->uMax));
+                        const double vMax = std::max(0.0, std::min(1.0, (double)bounds->vMax));
+                        dstX = (UINT)std::floor(uMin * (double)dstDesc.Width + 0.5);
+                        dstY = (UINT)std::floor(vMin * (double)dstDesc.Height + 0.5);
+                        dstW = (UINT)std::max(1.0, std::floor((uMax - uMin) * (double)dstDesc.Width + 0.5));
+                        dstH = (UINT)std::max(1.0, std::floor((vMax - vMin) * (double)dstDesc.Height + 0.5));
+                    } else {
+                        // Infer SxS / TB split when bounds are not provided
+                        if (dstDesc.Width >= (UINT)(dstDesc.Height * 1.7f)) {
+                            dstW = dstDesc.Width / 2u; dstH = dstDesc.Height;
+                            dstX = (eye == vr::Eye_Left) ? 0u : dstW; dstY = 0u;
+                        } else if (dstDesc.Height >= (UINT)(dstDesc.Width * 1.7f)) {
+                            dstW = dstDesc.Width; dstH = dstDesc.Height / 2u;
+                            dstX = 0u; dstY = (eye == vr::Eye_Left) ? 0u : dstH;
+                        } else {
+                            dstX = 0u; dstY = 0u; dstW = dstDesc.Width; dstH = dstDesc.Height;
                         }
-                        rtv->Release();
                     }
-                }
-                // Submit original texture (with original bounds) after copy/blit
-                if (copied) {
-                    if (flags & vr::Submit_TextureWithDepth) {
-                        const vr::VRTextureWithDepth_t* orig = reinterpret_cast<const vr::VRTextureWithDepth_t*>(texture);
-                        return g_realVRSubmit(self, eye, reinterpret_cast<const vr::Texture_t*>(orig), bounds, flags);
+                    // Copy full upscaled rect into the destination region (formats and MSAA must match)
+                    D3D11_TEXTURE2D_DESC srcDesc{}; up->GetDesc(&srcDesc);
+                    if (srcDesc.Format == dstDesc.Format && srcDesc.SampleDesc.Count == dstDesc.SampleDesc.Count && srcDesc.SampleDesc.Count == 1) {
+                        // Clamp copy size to destination bounds
+                        const UINT maxW = (dstX < dstDesc.Width)  ? (dstDesc.Width  - dstX) : 0u;
+                        const UINT maxH = (dstY < dstDesc.Height) ? (dstDesc.Height - dstY) : 0u;
+                        UINT copyW = srcDesc.Width; UINT copyH = srcDesc.Height;
+                        if (dstW > 0) copyW = (copyW > dstW) ? dstW : copyW;
+                        if (dstH > 0) copyH = (copyH > dstH) ? dstH : copyH;
+                        if (copyW > maxW) copyW = maxW;
+                        if (copyH > maxH) copyH = maxH;
+                        if (copyW > 0 && copyH > 0) {
+                            D3D11_BOX src{}; src.left = 0; src.top = 0; src.front = 0; src.right = copyW; src.bottom = copyH; src.back = 1;
+                            DLSSHooks::UnbindResourcesForSubmit();
+                            g_context->CopySubresourceRegion(colorTexture, 0, dstX, dstY, 0, up, 0, &src);
+                            DLSS_TRACE_SAMPLED(120,
+                                               "Submit eye=%d copy dst=(%u,%u %ux%u) src=(%ux%u)",
+                                               (int)eye, dstX, dstY, copyW, copyH, srcDesc.Width, srcDesc.Height);
+                            if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
+                                _MESSAGE("[Submit] Copy DLSS eye=%s dst=(%u,%u %ux%u) src=(%ux%u)",
+                                         eye==vr::Eye_Left?"L":"R", dstX, dstY, copyW, copyH, srcDesc.Width, srcDesc.Height);
+                            }
+                        }
+                    } else if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
+                        _MESSAGE("[Submit] Skip copy: fmt/msaa mismatch srcFmt=%u dstFmt=%u srcS=%u dstS=%u",
+                                 (unsigned)srcDesc.Format, (unsigned)dstDesc.Format,
+                                 (unsigned)srcDesc.SampleDesc.Count, (unsigned)dstDesc.SampleDesc.Count);
                     }
-                    return g_realVRSubmit(self, eye, texture, bounds, flags);
-                }
-            } while (false);
-
-            // Fallback: replace handle if copy/blit failed; fix bounds when atlas->single conversion likely
-            const vr::VRTextureBounds_t* submitBounds = bounds;
-            vr::VRTextureBounds_t fixedBounds{ 0.0f, 1.0f, 0.0f, 1.0f };
-            const bool dimsDiffer = (inDesc.Width != outDesc.Width) || (inDesc.Height != outDesc.Height);
-            if (dimsDiffer && bounds) {
-                const float uSpan = static_cast<float>(bounds->uMax - bounds->uMin);
-                const float vSpan = static_cast<float>(bounds->vMax - bounds->vMin);
-                const bool approxHalfU = (uSpan > 0.48f && uSpan < 0.52f);
-                const bool approxHalfV = (vSpan > 0.48f && vSpan < 0.52f);
-                const bool likelySxS = approxHalfU && (outDesc.Width * 2u <= inDesc.Width + 8u);
-                const bool likelyTB  = approxHalfV && (outDesc.Height * 2u <= inDesc.Height + 8u);
-                if (likelySxS || likelyTB) {
-                    submitBounds = &fixedBounds;
-                    _MESSAGE("[DLSS][Submit] Adjusted bounds for per-eye output (atlas->single)");
+                } else if (DlssTraceSampled(120)) {
+                    _MESSAGE("[DLSS_TRACE] Submit eye=%d skip copy (%s)",
+                             (int)eye,
+                             up ? "dlss returned original texture" : "dlss output null");
                 }
             }
-
-            _MESSAGE("[DLSS][Submit] Fallback to handle replacement path");
-            if (flags & vr::Submit_TextureWithDepth) {
-                vr::VRTextureWithDepth_t textureCopy = *reinterpret_cast<const vr::VRTextureWithDepth_t*>(texture);
-                textureCopy.handle = processedTexture;
-                return g_realVRSubmit(self, eye, reinterpret_cast<const vr::Texture_t*>(&textureCopy), submitBounds, flags);
-            }
-            vr::Texture_t textureCopy = *texture;
-            textureCopy.handle = processedTexture;
-            textureCopy.eType = vr::TextureType_DirectX;
-            return g_realVRSubmit(self, eye, &textureCopy, submitBounds, flags);
         }
 
         return g_realVRSubmit(self, eye, texture, bounds, flags);
+    }
+
+    vr::EVRCompositorError VR_CALLTYPE HookedVRCompositorSubmitWithArrayIndex(void* self,
+        vr::EVREye eye,
+        const vr::Texture_t* texture,
+        uint32_t unTextureArrayIndex,
+        const vr::VRTextureBounds_t* bounds,
+        vr::EVRSubmitFlags flags) {
+        if (!g_realVRSubmitWithArrayIndex) {
+            return vr::VRCompositorError_RequestFailed;
+        }
+
+        if (!texture) {
+            return g_realVRSubmitWithArrayIndex(self, eye, texture, unTextureArrayIndex, bounds, flags);
+        }
+
+        EnsureGlobalInstances();
+
+        // Track per-eye output size as in HookedVRCompositorSubmit
+        {
+            uint32_t recW = 0, recH = 0;
+            if (HMODULE openVRModule = GetModuleHandleW(L"openvr_api.dll")) {
+                using PFN_VR_GetGenericInterface = void* (VR_CALLTYPE*)(const char*, vr::EVRInitError*);
+                if (auto getIface = reinterpret_cast<PFN_VR_GetGenericInterface>(GetProcAddress(openVRModule, "VR_GetGenericInterface"))) {
+                    vr::EVRInitError err = vr::VRInitError_None;
+                    void* ptr = getIface(vr::IVRSystem_Version, &err);
+                    if (ptr && err == vr::VRInitError_None) {
+                        auto sys = reinterpret_cast<vr::IVRSystem*>(ptr);
+                        uint32_t w=0,h=0; sys->GetRecommendedRenderTargetSize(&w, &h);
+                        recW = w; recH = h;
+                    }
+                }
+            }
+            if (recW == 0 || recH == 0) {
+                ID3D11Texture2D* colorTexture = ExtractColorTexture(texture);
+                if (colorTexture) {
+                    D3D11_TEXTURE2D_DESC eyeDesc{}; colorTexture->GetDesc(&eyeDesc);
+                    uint32_t fullW = eyeDesc.Width;
+                    uint32_t fullH = eyeDesc.Height;
+                    double uSpan = 1.0, vSpan = 1.0;
+                    if (bounds) {
+                        uSpan = std::max(0.0, std::min(1.0, (double)bounds->uMax - (double)bounds->uMin));
+                        vSpan = std::max(0.0, std::min(1.0, (double)bounds->vMax - (double)bounds->vMin));
+                    }
+                    recW = (uint32_t)std::max(1.0, uSpan * (double)fullW);
+                    recH = (uint32_t)std::max(1.0, vSpan * (double)fullH);
+                    const bool fullSpan = (uSpan > 0.99 && vSpan > 0.99) || !bounds;
+                    if (fullSpan) {
+                        if (fullW >= (uint32_t)((double)fullH * 1.7)) { recW = fullW / 2u; recH = fullH; }
+                        else if (fullH >= (uint32_t)((double)fullW * 1.7)) { recW = fullW; recH = fullH / 2u; }
+                    }
+                }
+            }
+            recW &= ~1u; recH &= ~1u;
+            const int idx = (eye == vr::Eye_Left) ? 0 : 1;
+            if (recW > 0 && recH > 0) {
+                g_perEyeOutW[idx].store(recW, std::memory_order_relaxed);
+                g_perEyeOutH[idx].store(recH, std::memory_order_relaxed);
+            }
+        }
+
+        if (EnsureDLSSRuntimeReady() && (!g_dlssConfig || g_dlssConfig->submitCopyEnabled)) {
+            ID3D11Texture2D* colorTexture = ExtractColorTexture(texture);
+            if (colorTexture && g_device && g_context && g_dlssManager && g_dlssManager->IsEnabled()) {
+                uint32_t outW = 0, outH = 0;
+                (void)DLSSHooks::GetPerEyeDisplaySize(eye == vr::Eye_Left ? 0 : 1, outW, outH);
+                D3D11_TEXTURE2D_DESC dstDesc{}; colorTexture->GetDesc(&dstDesc);
+        ID3D11Texture2D* up = (eye == vr::Eye_Left)
+            ? g_dlssManager->ProcessLeftEye(colorTexture, g_fallbackDepthTexture, g_motionVectorTexture)
+            : g_dlssManager->ProcessRightEye(colorTexture, g_fallbackDepthTexture, g_motionVectorTexture);
+        if (up && up != colorTexture) {
+                    UINT dstX = 0, dstY = 0; UINT dstW = outW ? outW : dstDesc.Width; UINT dstH = outH ? outH : dstDesc.Height;
+                    if (bounds) {
+                        const double uMin = std::max(0.0, std::min(1.0, (double)bounds->uMin));
+                        const double vMin = std::max(0.0, std::min(1.0, (double)bounds->vMin));
+                        const double uMax = std::max(0.0, std::min(1.0, (double)bounds->uMax));
+                        const double vMax = std::max(0.0, std::min(1.0, (double)bounds->vMax));
+                        dstX = (UINT)std::floor(uMin * (double)dstDesc.Width + 0.5);
+                        dstY = (UINT)std::floor(vMin * (double)dstDesc.Height + 0.5);
+                        dstW = (UINT)std::max(1.0, std::floor((uMax - uMin) * (double)dstDesc.Width + 0.5));
+                        dstH = (UINT)std::max(1.0, std::floor((vMax - vMin) * (double)dstDesc.Height + 0.5));
+                    }
+                    D3D11_TEXTURE2D_DESC srcDesc{}; up->GetDesc(&srcDesc);
+                    if (srcDesc.Format == dstDesc.Format && srcDesc.SampleDesc.Count == dstDesc.SampleDesc.Count && srcDesc.SampleDesc.Count == 1) {
+                        const UINT maxW = (dstX < dstDesc.Width)  ? (dstDesc.Width  - dstX) : 0u;
+                        const UINT maxH = (dstY < dstDesc.Height) ? (dstDesc.Height - dstY) : 0u;
+                        UINT copyW = srcDesc.Width; UINT copyH = srcDesc.Height;
+                        if (dstW > 0) copyW = (copyW > dstW) ? dstW : copyW;
+                        if (dstH > 0) copyH = (copyH > dstH) ? dstH : copyH;
+                        if (copyW > maxW) copyW = maxW;
+                        if (copyH > maxH) copyH = maxH;
+                        if (copyW > 0 && copyH > 0) {
+                            const UINT dstSub = D3D11CalcSubresource(0, std::min(unTextureArrayIndex, dstDesc.ArraySize ? (dstDesc.ArraySize-1) : 0u), dstDesc.MipLevels ? dstDesc.MipLevels : 1u);
+                            D3D11_BOX src{}; src.left = 0; src.top = 0; src.front = 0; src.right = copyW; src.bottom = copyH; src.back = 1;
+                            DLSSHooks::UnbindResourcesForSubmit();
+                            g_context->CopySubresourceRegion(colorTexture, dstSub, dstX, dstY, 0, up, 0, &src);
+                            DLSS_TRACE_SAMPLED(120,
+                                               "SubmitIdx eye=%d copy dst=(%u,%u %ux%u sub=%u) src=(%ux%u)",
+                                               (int)eye, dstX, dstY, copyW, copyH, dstSub, srcDesc.Width, srcDesc.Height);
+                        }
+                    } else if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
+                        _MESSAGE("[SubmitIdx] Skip copy: fmt/msaa mismatch srcFmt=%u dstFmt=%u srcS=%u dstS=%u",
+                                 (unsigned)srcDesc.Format, (unsigned)dstDesc.Format,
+                                 (unsigned)srcDesc.SampleDesc.Count, (unsigned)dstDesc.SampleDesc.Count);
+                    }
+                } else if (DlssTraceSampled(120)) {
+                    _MESSAGE("[DLSS_TRACE] SubmitIdx eye=%d skip copy (%s)",
+                             (int)eye,
+                             up ? "dlss returned original texture" : "dlss output null");
+                }
+            }
+        }
+
+        return g_realVRSubmitWithArrayIndex(self, eye, texture, unTextureArrayIndex, bounds, flags);
     }
 
     void EnsureVRSubmitHookInstalled() {
@@ -861,12 +1103,7 @@ namespace {
             return;
         }
 
-        if (HookVTableFunction(compositor, 6, HookedVRCompositorSubmit, &g_realVRSubmit)) {
-            g_vrSubmitHookInstalled = true;
-            g_loggedSubmitFailure = false;
-            _MESSAGE("OpenVR Submit hook installed successfully");
-            g_state.store(DlssState::HaveCompositor, std::memory_order_relaxed);
-        } else if (!g_loggedSubmitFailure) {
+        bool okSubmit = HookVTableFunction(compositor, 6, HookedVRCompositorSubmit, &g_realVRSubmit); bool okSubmitArr = HookVTableFunction(compositor, 7, HookedVRCompositorSubmitWithArrayIndex, &g_realVRSubmitWithArrayIndex); if (okSubmit) { g_vrSubmitHookInstalled = true; g_loggedSubmitFailure = false; _MESSAGE("OpenVR Submit hook installed successfully"); if (okSubmitArr) { _MESSAGE("OpenVR SubmitWithArrayIndex hook installed successfully"); } g_state.store(DlssState::HaveCompositor, std::memory_order_relaxed); } else if (!g_loggedSubmitFailure) { _ERROR("Failed to install OpenVR Submit hook"); g_loggedSubmitFailure = true; } else if (!g_loggedSubmitFailure) {
             _ERROR("Failed to install OpenVR Submit hook");
             g_loggedSubmitFailure = true;
         }
@@ -893,6 +1130,9 @@ namespace {
             // Hook CreateDeferredContext to reach all deferred contexts
             HookVTableFunction(device, 27, DLSSHooks::HookedCreateDeferredContext, &DLSSHooks::RealCreateDeferredContext);
             _MESSAGE("ID3D11Device::CreateDeferredContext hook installed");
+            // Hook CreateSamplerState to apply Mip LOD Bias (PureDark-style)
+            HookVTableFunction(device, 23, DLSSHooks::HookedCreateSamplerState, &DLSSHooks::RealCreateSamplerState);
+            _MESSAGE("ID3D11Device::CreateSamplerState hook installed");
         } else {
             g_deviceHookInstalled = false;
             _ERROR("Failed to hook ID3D11Device::CreateTexture2D");
@@ -934,6 +1174,7 @@ namespace {
     }
 
     bool IsMotionVectorCandidate(const D3D11_TEXTURE2D_DESC& desc, UINT targetWidth, UINT targetHeight) {
+        // Typical MV: R16G16_FLOAT, SRV+RTV, single-sample, single-mip, reasonably large
         if (desc.Format != DXGI_FORMAT_R16G16_FLOAT) {
             return false;
         }
@@ -943,17 +1184,34 @@ namespace {
             return false;
         }
 
-        if (targetWidth && targetHeight) {
-            if (desc.Width != targetWidth || desc.Height != targetHeight) {
-                return false;
-            }
-        }
-
         if (desc.MipLevels != 1 || desc.ArraySize != 1 || desc.SampleDesc.Count != 1) {
             return false;
         }
 
-        return true;
+        if (desc.Width < 256 || desc.Height < 256) {
+            return false;
+        }
+
+        // If we know a target (mirror) size, accept a broad range since VR render/MV is often a fraction of it.
+        if (targetWidth && targetHeight) {
+            const float wRatio = static_cast<float>(desc.Width) / static_cast<float>(targetWidth);
+            const float hRatio = static_cast<float>(desc.Height) / static_cast<float>(targetHeight);
+            // Accept 25%..100% range and common SxS (half width) cases
+            const bool inRange = (wRatio >= 0.25f && wRatio <= 1.01f) && (hRatio >= 0.25f && hRatio <= 1.01f);
+            if (inRange) {
+                return true;
+            }
+        }
+
+        // Fallback: compare against detected scene RT (or half width for SxS atlases)
+        if (g_sceneRTDesc.Width > 0 && g_sceneRTDesc.Height > 0) {
+            if ((desc.Width == g_sceneRTDesc.Width && desc.Height == g_sceneRTDesc.Height) ||
+                (desc.Width == (g_sceneRTDesc.Width / 2u) && desc.Height == g_sceneRTDesc.Height)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     bool IsDepthCandidate(const D3D11_TEXTURE2D_DESC& desc, UINT targetWidth, UINT targetHeight) {
@@ -996,8 +1254,24 @@ namespace {
         const UINT matchWidth = haveSwapSize ? targetWidth : 0;
         const UINT matchHeight = haveSwapSize ? targetHeight : 0;
 
+        // Probe log for potential motion vector textures (R16G16_FLOAT)
+        if (desc.Format == DXGI_FORMAT_R16G16_FLOAT) {
+            const float wRatio = matchWidth  ? (float)desc.Width  / (float)matchWidth  : 0.0f;
+            const float hRatio = matchHeight ? (float)desc.Height / (float)matchHeight : 0.0f;
+            const bool mvCand = IsMotionVectorCandidate(desc, matchWidth, matchHeight);
+            _MESSAGE("[MVProbe] R16G16F %ux%u mips=%u samples=%u flags=0x%08X usage=%u tgt=%ux%u wr=%.2f hr=%.2f cand=%d",
+                     desc.Width, desc.Height,
+                     (unsigned)desc.MipLevels,
+                     (unsigned)desc.SampleDesc.Count,
+                     (unsigned)desc.BindFlags,
+                     (unsigned)desc.Usage,
+                     matchWidth, matchHeight,
+                     wRatio, hRatio,
+                     mvCand ? 1 : 0);
+        }
+
         if (IsMotionVectorCandidate(desc, matchWidth, matchHeight)) {
-            DLSSHooks::RegisterMotionVectorTexture(texture);
+            DLSSHooks::RegisterMotionVectorTexture(texture, &desc, matchWidth, matchHeight);
             return;
         }
 
@@ -1046,12 +1320,53 @@ namespace DLSSHooks {
             return E_FAIL;
         }
 
-        HRESULT result = RealCreateTexture2D(device, desc, initialData, texture);
-        if (FAILED(result) || !desc || !texture || !*texture) {
+        // Deterministic downscale: PureDark-style small RT creation for scene color targets
+        // Safety: Only enable after VR Submit hook is installed to avoid breaking HMD bring-up
+        D3D11_TEXTURE2D_DESC local{};
+        const D3D11_TEXTURE2D_DESC* useDesc = desc;
+        bool modified = false;
+        if (desc) {
+            local = *desc;
+            // Only when enabled
+            if (g_dlssConfig && g_dlssConfig->earlyDlssEnabled && g_vrSubmitHookInstalled) {
+                // Avoid touching depth/typeless DS, shared, non-RT
+                const bool isColorRT = (local.BindFlags & D3D11_BIND_RENDER_TARGET) && (local.BindFlags & D3D11_BIND_SHADER_RESOURCE) && ((local.BindFlags & D3D11_BIND_DEPTH_STENCIL) == 0);
+                if (isColorRT && IsLikelyVRSceneRT(local)) {
+                    // Determine per-eye output and render sizes
+                    uint32_t eyeW = 0, eyeH = 0;
+                    (void)DLSSHooks::GetPerEyeDisplaySize(0, eyeW, eyeH);
+                    if (!eyeW || !eyeH) (void)DLSSHooks::GetPerEyeDisplaySize(1, eyeW, eyeH);
+                    if (eyeW && eyeH && g_dlssManager) {
+                        uint32_t prW = 0, prH = 0;
+                        if (g_dlssManager->ComputeRenderSizeForOutput(eyeW, eyeH, prW, prH)) {
+                            // Heuristic: shrink only if current size matches eye/native or SxS atlas
+                            const bool looksEye = ApproxEqUINT(local.Width, eyeW) && ApproxEqUINT(local.Height, eyeH);
+                            const bool looksSxS = ApproxEqUINT(local.Width, eyeW * 2u) && ApproxEqUINT(local.Height, eyeH);
+                            const bool looksRender = ApproxEqUINT(local.Width, prW) && ApproxEqUINT(local.Height, prH);
+                            const bool looksRenderSxS = ApproxEqUINT(local.Width, prW * 2u) && ApproxEqUINT(local.Height, prH);
+                            if (!looksRender && !looksRenderSxS && (looksEye || looksSxS)) {
+                                // Keep format/sample/mips; shrink dimensions only
+                                local.Width  = looksSxS ? (prW * 2u) : prW;
+                                local.Height = prH;
+                                useDesc = &local;
+                                modified = true;
+                                if (g_dlssConfig->debugEarlyDlss) {
+                                    _MESSAGE("[CreateTex2D][Scale] %ux%u -> %ux%u fmt=%u", desc->Width, desc->Height, local.Width, local.Height, (unsigned)local.Format);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        HRESULT result = RealCreateTexture2D(device, useDesc, initialData, texture);
+        if (FAILED(result) || !useDesc || !texture || !*texture) {
             return result;
         }
 
-        DetectSpecialTextures(*desc, *texture);
+        // Mark depth candidates for fallback selection and other probes
+        DetectSpecialTextures(*useDesc, *texture);
         return result;
     }
 
@@ -1073,6 +1388,28 @@ namespace DLSSHooks {
             _MESSAGE("Deferred context hooks installed (OMSetRenderTargets, RSSetViewports)");
         }
         return hr;
+    }
+
+    HRESULT STDMETHODCALLTYPE HookedCreateSamplerState(ID3D11Device* device,
+        const D3D11_SAMPLER_DESC* pDesc,
+        ID3D11SamplerState** ppSamplerState) {
+        if (!RealCreateSamplerState) {
+            return E_FAIL;
+        }
+        if (!pDesc) {
+            return RealCreateSamplerState(device, pDesc, ppSamplerState);
+        }
+        D3D11_SAMPLER_DESC sd = *pDesc;
+        // Apply Mip LOD Bias if configured and original bias == 0
+        if (g_dlssConfig && g_dlssConfig->useOptimalMipLodBias) {
+            // Heuristic: only adjust simple samplers (low anisotropy)
+            if (sd.MipLODBias == 0.0f && sd.MaxAnisotropy <= 1) {
+                float bias = g_dlssConfig->mipLodBias;
+                if (bias < -3.0f) bias = -3.0f; if (bias > 3.0f) bias = 3.0f;
+                sd.MipLODBias = bias;
+            }
+        }
+        return RealCreateSamplerState(device, &sd, ppSamplerState);
     }
 }
 
@@ -1361,7 +1698,7 @@ namespace DLSSHooks {
         return true;
     }
 
-    static bool ApproxEqUINT(UINT a, UINT b, float relTol = 0.1f) {
+    static bool ApproxEqUINT(UINT a, UINT b, float relTol) {
         if (a == b) return true;
         float fa = static_cast<float>(a), fb = static_cast<float>(b);
         float diff = fabsf(fa - fb);
@@ -1416,42 +1753,48 @@ namespace DLSSHooks {
     }
 
     void STDMETHODCALLTYPE HookedOMSetRenderTargets(ID3D11DeviceContext* ctx, UINT numRTVs, ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV) {
+        const bool earlyActive = IsEarlyDlssActive();
         // Composite small->big if a post/HUD big RT is bound after redirect
         // but never re-enter while we are inside the composite blit itself
-        if (!g_inComposite.load(std::memory_order_relaxed) && ppRTVs && numRTVs > 0 && ppRTVs[0]) {
+        if (earlyActive && !g_inComposite.load(std::memory_order_relaxed) && ppRTVs && numRTVs > 0 && ppRTVs[0]) {
             CompositeIfNeededOnBigBind(ppRTVs[0]);
         }
         if (!ppRTVs || numRTVs == 0 || !ppRTVs[0]) {
             if (RealOMSetRenderTargets) RealOMSetRenderTargets(ctx, numRTVs, ppRTVs, pDSV);
             return;
         }
-        // Detect scene begin on any mode, but only flag VR eye scene RTs (avoid mirror backbuffer)
-        D3D11_TEXTURE2D_DESC d{};
-        if (GetDescFromRTV(ppRTVs[0], &d)) {
-            if (IsLikelyVRSceneRT(d)) {
-                g_sceneRTDesc = d;
-                g_sceneActive.store(true, std::memory_order_relaxed);
-                if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
-                    _MESSAGE("[EarlyDLSS][SceneBegin] RTV=%ux%u fmt=%u", d.Width, d.Height, (unsigned)d.Format);
-                }
-            } else {
-                // If we detect the mirror swapchain backbuffer, explicitly end scene for clamp
-                UINT sw=0, sh=0; if (GetSwapChainSize(sw, sh) && d.Width==sw && d.Height==sh) {
-                    if (g_sceneActive.load(std::memory_order_relaxed)) {
-                        g_sceneActive.store(false, std::memory_order_relaxed);
-                        if (g_dlssConfig && g_dlssConfig->debugEarlyDlss && g_clampLogBudgetPerFrame > 0) {
-                            _MESSAGE("[EarlyDLSS][SceneEnd] Mirror backbuffer bound %ux%u — clamp disabled", d.Width, d.Height);
-                            --g_clampLogBudgetPerFrame;
+        // Detect scene begin/end only when Early DLSS logic is active
+        if (earlyActive) {
+            D3D11_TEXTURE2D_DESC d{};
+            if (GetDescFromRTV(ppRTVs[0], &d)) {
+                if (IsLikelyVRSceneRT(d)) {
+                    g_sceneRTDesc = d;
+                    g_sceneActive.store(true, std::memory_order_relaxed);
+                    if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
+                        _MESSAGE("[EarlyDLSS][SceneBegin] RTV=%ux%u fmt=%u", d.Width, d.Height, (unsigned)d.Format);
+                    }
+                } else {
+                    // If we detect the mirror swapchain backbuffer, explicitly end scene for clamp
+                    UINT sw=0, sh=0;
+                    if (GetSwapChainSize(sw, sh) && d.Width==sw && d.Height==sh) {
+                        if (g_sceneActive.load(std::memory_order_relaxed)) {
+                            g_sceneActive.store(false, std::memory_order_relaxed);
+                            if (g_dlssConfig && g_dlssConfig->debugEarlyDlss && g_clampLogBudgetPerFrame > 0) {
+                                _MESSAGE("[EarlyDLSS][SceneEnd] Mirror backbuffer bound %ux%u - clamp disabled", d.Width, d.Height);
+                                --g_clampLogBudgetPerFrame;
+                            }
                         }
                     }
                 }
             }
+        } else {
+            g_sceneActive.store(false, std::memory_order_relaxed);
         }
 
         // Redirect only when enabled and mode == rt_redirect (1) and only once per frame
         bool didRedirect = false;
         if (!g_inComposite.load(std::memory_order_relaxed) &&
-            g_dlssConfig && g_dlssConfig->earlyDlssEnabled && g_dlssConfig->earlyDlssMode == 1 && !g_redirectUsedThisFrame.load(std::memory_order_relaxed)) {
+            earlyActive && g_dlssConfig->earlyDlssMode == 1 && !g_redirectUsedThisFrame.load(std::memory_order_relaxed)) {
             // Only attempt redirect when the currently bound RTV also looks like the VR scene RT
             D3D11_TEXTURE2D_DESC boundDesc{};
             bool haveBound = GetDescFromRTV(ppRTVs[0], &boundDesc);
@@ -1467,7 +1810,22 @@ namespace DLSSHooks {
                 (void)DLSSHooks::GetPerEyeDisplaySize(1, outRw, outRh);
                 uint32_t tgtOutW = outLw ? outLw : outRw;
                 uint32_t tgtOutH = outLh ? outLh : outRh;
-                if (tgtOutW == 0 || tgtOutH == 0) { tgtOutW = g_sceneRTDesc.Width; tgtOutH = g_sceneRTDesc.Height; }
+                if (tgtOutW == 0 || tgtOutH == 0) {
+                    // Fallback: infer per-eye dimensions from scene RT atlas shape
+                    if (g_sceneRTDesc.Width >= (UINT)(g_sceneRTDesc.Height * 1.7f)) {
+                        // Side-by-side atlas
+                        tgtOutW = g_sceneRTDesc.Width / 2u;
+                        tgtOutH = g_sceneRTDesc.Height;
+                    } else if (g_sceneRTDesc.Height >= (UINT)(g_sceneRTDesc.Width * 1.7f)) {
+                        // Top-bottom atlas
+                        tgtOutW = g_sceneRTDesc.Width;
+                        tgtOutH = g_sceneRTDesc.Height / 2u;
+                    } else {
+                        // Unknown, treat as single eye
+                        tgtOutW = g_sceneRTDesc.Width;
+                        tgtOutH = g_sceneRTDesc.Height;
+                    }
+                }
                 uint32_t prW=0, prH=0;
                 if (g_dlssManager && g_dlssManager->ComputeRenderSizeForOutput(tgtOutW, tgtOutH, prW, prH)) {
                     if (prW > 0 && prH > 0 && (prW < g_sceneRTDesc.Width || prH < g_sceneRTDesc.Height)) {
@@ -1481,6 +1839,34 @@ namespace DLSSHooks {
                                 _MESSAGE("[EarlyDLSS][Redirect] RTV old=%ux%u -> small=%ux%u", g_sceneRTDesc.Width, g_sceneRTDesc.Height, prW, prH);
                             }
                             if (RealOMSetRenderTargets) RealOMSetRenderTargets(ctx, numRTVs, rtvs.data(), pDSV);
+
+                            // After redirect, scale existing viewports so both eyes map into the smaller RT.
+                            // This repositions right-eye viewports (TopLeftX/TopLeftY) and scales dimensions.
+                            const float sx = tgtOutW > 0 ? (float)prW / (float)tgtOutW : 1.0f;
+                            const float sy = tgtOutH > 0 ? (float)prH / (float)tgtOutH : 1.0f;
+                            if (sx > 0.0f && sy > 0.0f) {
+                                UINT vpCount = 0;
+                                ctx->RSGetViewports(&vpCount, nullptr);
+                                if (vpCount > 0) {
+                                    std::vector<D3D11_VIEWPORT> vps(vpCount);
+                                    ctx->RSGetViewports(&vpCount, vps.data());
+                                    for (UINT i = 0; i < vpCount; ++i) {
+                                        D3D11_VIEWPORT& vp = vps[i];
+                                        vp.TopLeftX = vp.TopLeftX * sx;
+                                        vp.TopLeftY = vp.TopLeftY * sy;
+                                        float newW = vp.Width * sx;
+                                        float newH = vp.Height * sy;
+                                        // Clamp to at least 1 pixel and even-align like the rest of the pipeline
+                                        if (newW < 1.0f) newW = 1.0f;
+                                        if (newH < 1.0f) newH = 1.0f;
+                                        // Round to nearest integer for stability
+                                        vp.Width  = floorf(newW + 0.5f);
+                                        vp.Height = floorf(newH + 0.5f);
+                                    }
+                                    if (RealRSSetViewports) RealRSSetViewports(ctx, vpCount, vps.data());
+                                    else ctx->RSSetViewports(vpCount, vps.data());
+                                }
+                            }
                             didRedirect = true;
                             g_redirectUsedThisFrame.store(true, std::memory_order_relaxed);
                             // Do not call Real again below
@@ -1497,8 +1883,8 @@ namespace DLSSHooks {
     }
 
     void STDMETHODCALLTYPE HookedRSSetViewports(ID3D11DeviceContext* ctx, UINT count, const D3D11_VIEWPORT* viewports) {
-        // Default: pass through
-        if (!g_dlssConfig || !g_dlssConfig->earlyDlssEnabled || g_dlssConfig->earlyDlssMode != 0 || !viewports || count == 0) {
+        // Clamp viewports when Early DLSS is enabled (both clamp and redirect modes)
+        if (!g_dlssConfig || !g_dlssConfig->earlyDlssEnabled || !viewports || count == 0) {
             if (RealRSSetViewports) RealRSSetViewports(ctx, count, viewports);
             return;
         }
@@ -1639,26 +2025,49 @@ static ID3D11RenderTargetView* GetOrCreateSmallRTVFor(ID3D11RenderTargetView* bi
             if (it == g_redirectMap.end() || !it->second.smallTex) { bigTex->Release(); return; }
             entry = it->second;
         }
-        // Composite small->big; optional HQ path can be enabled via config
+        // Composite small->big via DLSS per-eye evaluate and atlas copy
         if (g_dlssManager && entry.smallTex) {
             g_inComposite.store(true, std::memory_order_relaxed);
-            // Ensure we clear the flag even if blit path bails out
             bool ok = false;
-            if (g_dlssConfig && g_dlssConfig->highQualityComposite) {
-                // Placeholder: fall back to linear blit for now
-                if (g_dlssConfig->debugEarlyDlss) {
-                    _MESSAGE("[EarlyDLSS][Composite] HQ path enabled (linear fallback)");
+            // Determine per-eye output size (prefer IVRSystem recommendation)
+            uint32_t outW = 0, outH = 0;
+            (void)DLSSHooks::GetPerEyeDisplaySize(0, outW, outH);
+            if (outW == 0 || outH == 0) {
+                // Fallback: derive from big RT size if double-wide
+                D3D11_TEXTURE2D_DESC bigDesc{}; bigTex->GetDesc(&bigDesc);
+                if (bigDesc.Width >= (UINT)(bigDesc.Height * 1.7f)) { outW = bigDesc.Width / 2u; outH = bigDesc.Height; }
+            }
+            if (outW && outH) {
+                // Evaluate per-eye
+                ID3D11Texture2D* depth = g_fallbackDepthTexture;
+                ID3D11Texture2D* mv = g_motionVectorTexture;
+                ID3D11Texture2D* leftOut = g_dlssManager->ProcessLeftEye(entry.smallTex, depth, mv);
+                ID3D11Texture2D* rightOut = g_dlssManager->ProcessRightEye(entry.smallTex, depth, mv);
+                if (leftOut && rightOut && g_context) {
+                    D3D11_TEXTURE2D_DESC l{}; leftOut->GetDesc(&l);
+                    D3D11_TEXTURE2D_DESC r{}; rightOut->GetDesc(&r);
+                    // Copy per-eye outputs into big texture halves BEFORE binding it
+                    D3D11_BOX src{}; src.front = 0; src.top = 0; src.left = 0; src.back = 1;
+                    // Left half
+                    src.right = l.Width; src.bottom = l.Height;
+                    g_context->CopySubresourceRegion(bigTex, 0, 0, 0, 0, leftOut, 0, &src);
+                    // Right half
+                    src.right = r.Width; src.bottom = r.Height;
+                    g_context->CopySubresourceRegion(bigTex, 0, outW, 0, 0, rightOut, 0, &src);
+                    ok = true;
                 }
             }
-            // Default linear blit
-            ok = g_dlssManager->BlitToRTV(entry.smallTex, bigRTV, g_sceneRTDesc.Width, g_sceneRTDesc.Height);
             if (ok) {
                 g_compositedThisFrame = true;
                 if (g_dlssConfig->debugEarlyDlss) {
-                    _MESSAGE("[EarlyDLSS][Composite] small->big %ux%u", g_sceneRTDesc.Width, g_sceneRTDesc.Height);
+                    _MESSAGE("[EarlyDLSS][Composite] DLSS engine-copy to %ux%u (per-eye out %ux%u)", g_sceneRTDesc.Width, g_sceneRTDesc.Height, outW, outH);
                 }
+            } else if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
+                _MESSAGE("[EarlyDLSS][Composite] DLSS engine-copy skipped (no sizes or outputs)");
             }
             g_inComposite.store(false, std::memory_order_relaxed);
         }
         bigTex->Release();
     }
+    
+

@@ -9,6 +9,8 @@
 #include <sl_dlss.h>
 #endif
 #include "common/IDebugLog.h"
+// Access config for SL-only toggle
+extern DLSSConfig* g_dlssConfig;
 
 #include <algorithm>
 #include <string>
@@ -16,6 +18,9 @@
 #include <windows.h>
 #include <shlobj.h>
 #include <d3dcompiler.h>
+#include <atomic>
+#include <unordered_set>
+#include <mutex>
 
 #if __has_include(<nvsdk_ngx.h>) && __has_include(<nvsdk_ngx_params.h>)
 #include <nvsdk_ngx.h>
@@ -25,6 +30,37 @@
 #endif
 namespace {
     HMODULE g_ngxModule = nullptr;
+
+    bool LogOnce(const char* tag) {
+        static std::mutex s_logOnceMutex;
+        static std::unordered_set<std::string> s_seen;
+        if (!tag) {
+            tag = "dlss_manager_log_once";
+        }
+        std::lock_guard<std::mutex> lock(s_logOnceMutex);
+        return s_seen.insert(tag).second;
+    }
+
+    bool ShouldLogSampledEvent() {
+        if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
+            return true;
+        }
+        static std::atomic<uint32_t> counter{0};
+        uint32_t value = counter.fetch_add(1, std::memory_order_relaxed) + 1u;
+        return (value % 180u) == 1u;
+    }
+
+    inline bool DlssManagerTraceEnabled() {
+        return g_dlssConfig && g_dlssConfig->debugEarlyDlss;
+    }
+
+    inline bool DlssManagerTraceSampled(uint32_t modulo) {
+        if (!DlssManagerTraceEnabled() || modulo == 0) {
+            return false;
+        }
+        static std::atomic<uint32_t> s_traceCounter{0};
+        return (s_traceCounter.fetch_add(1, std::memory_order_relaxed) % modulo) == 0;
+    }
 
     std::string WideToUtf8(const std::wstring& value) {
         if (value.empty()) {
@@ -53,6 +89,23 @@ namespace {
 
         wchar_t buffer[MAX_PATH];
         const DWORD length = GetModuleFileNameW(module, buffer, static_cast<DWORD>(_countof(buffer)));
+        if (length == 0 || length >= _countof(buffer)) {
+            return {};
+        }
+
+        std::wstring path(buffer, buffer + length);
+        const size_t slash = path.find_last_of(L"/\\");
+        if (slash != std::wstring::npos) {
+            path.erase(slash + 1);
+        } else {
+            path.clear();
+        }
+        return path;
+    }
+
+    std::wstring GetExecutableDirectory() {
+        wchar_t buffer[MAX_PATH] = {};
+        const DWORD length = GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(_countof(buffer)));
         if (length == 0 || length >= _countof(buffer)) {
             return {};
         }
@@ -125,25 +178,35 @@ namespace {
             return true;
         }
 
-        std::wstring pluginDir = GetPluginDirectory();
-        if (!pluginDir.empty()) {
-            std::wstring localPath = pluginDir + L"nvngx_dlss.dll";
-            g_ngxModule = LoadLibraryExW(localPath.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-            if (g_ngxModule) {
-                std::string pathUtf8 = WideToUtf8(localPath);
-                _MESSAGE("Loaded nvngx_dlss.dll from plugin directory: %s", pathUtf8.c_str());
-            } else {
-                std::string pathUtf8 = WideToUtf8(localPath);
-                _MESSAGE("Failed to load nvngx_dlss.dll from plugin directory (%s); trying process search path", pathUtf8.c_str());
+        auto TryLoadFromDirectory = [&](const std::wstring& dir) -> bool {
+            if (dir.empty()) {
+                return false;
             }
+            std::wstring dllPath = dir + L"nvngx_dlss.dll";
+            if (GetFileAttributesW(dllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                return false;
+            }
+            HMODULE mod = LoadLibraryExW(dllPath.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+            if (mod) {
+                g_ngxModule = mod;
+                _MESSAGE("[NGX] Loaded nvngx_dlss.dll from %s", WideToUtf8(dllPath).c_str());
+                return true;
+            }
+            _MESSAGE("[NGX] Failed to load nvngx_dlss.dll from %s", WideToUtf8(dllPath).c_str());
+            return false;
+        };
+
+        std::wstring pluginDir = GetPluginDirectory();
+        std::wstring exeDir = GetExecutableDirectory();
+
+        if (!TryLoadFromDirectory(pluginDir)) {
+            TryLoadFromDirectory(exeDir);
         }
 
         if (!g_ngxModule) {
-            g_ngxModule = LoadLibraryW(L"nvngx_dlss.dll");
-        }
-
-        if (!g_ngxModule) {
-            _ERROR("Failed to load nvngx_dlss.dll from plugin directory or process search path");
+            _ERROR("Failed to load nvngx_dlss.dll from plugin (%s) or game directory (%s)",
+                   WideToUtf8(pluginDir).c_str(),
+                   WideToUtf8(exeDir).c_str());
             return false;
         }
 
@@ -243,7 +306,32 @@ namespace {
                 return NVSDK_NGX_PerfQuality_Value_MaxQuality;
         }
     }
+
+    DXGI_FORMAT ResolveSRVFormat(DXGI_FORMAT format) {
+        switch (format) {
+            case DXGI_FORMAT_R24G8_TYPELESS: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+            case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_R32_FLOAT;
+            case DXGI_FORMAT_R32G8X24_TYPELESS: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+            case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_R16_UNORM;
+            case DXGI_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_FLOAT;
+            case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+            case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+            case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+            default: return format;
+        }
+    }
+
+    DXGI_FORMAT GetDepthTargetFormat() {
+        return DXGI_FORMAT_R32_FLOAT;
+    }
+
+    DXGI_FORMAT GetMotionTargetFormat() {
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    }
 }
+
+#define DLSSM_TRACE(fmt, ...)            do { if (DlssManagerTraceEnabled()) _MESSAGE("[DLSS_TRACE] " fmt, __VA_ARGS__); } while (0)
+#define DLSSM_TRACE_SAMPLED(mod, fmt, ...) do { if (DlssManagerTraceSampled(mod)) _MESSAGE("[DLSS_TRACE] " fmt, __VA_ARGS__); } while (0)
 
 DLSSManager* g_dlssManager = nullptr;
 DLSSConfig* g_dlssConfig = nullptr;
@@ -292,6 +380,10 @@ bool DLSSManager::Initialize() {
         delete m_backend;
         m_backend = nullptr;
         m_slBackend = nullptr;
+        if (g_dlssConfig && g_dlssConfig->streamlineOnly) {
+            _ERROR("[CFG] SL-only mode enabled; NGX fallback disabled");
+            return false;
+        }
     }
 #else
     m_backend = nullptr;
@@ -299,12 +391,23 @@ bool DLSSManager::Initialize() {
 
     // Keep NGX path as fallback (if SL not used or failed)
     if (!m_backend || !m_backend->IsReady()) {
+        if (g_dlssConfig && g_dlssConfig->streamlineOnly) {
+            _ERROR("[CFG] SL-only mode enabled; skipping NGX fallback");
+            return false;
+        }
         _MESSAGE("[DLSS] Using NGX fallback path");
         if (!InitializeNGX()) {
             return false;
         }
     } else {
         _MESSAGE("[DLSS] Using Streamline backend (DLSS SR)");
+#if USE_STREAMLINE
+        // Ensure backend options reflect current config immediately after init
+        if (m_backend && m_backend->IsReady()) {
+            m_backend->SetQuality(static_cast<int>(m_quality));
+            m_backend->SetSharpness(m_sharpeningEnabled ? m_sharpness : 0.0f);
+        }
+#endif
     }
 
     m_initialized = true;
@@ -632,10 +735,17 @@ bool DLSSManager::BlitToRTV(ID3D11Texture2D* src, ID3D11RenderTargetView* dstRTV
     m_context->PSSetShader(m_fsPS, nullptr, 0);
     // Default UV window for full texture copy
     if (m_fsCB) {
+        const float uvOffsetX = 0.0f;
+        const float uvOffsetY = 0.0f;
+        const float uvScaleX = 1.0f;
+        const float uvScaleY = 1.0f;
         D3D11_MAPPED_SUBRESOURCE map{};
         if (SUCCEEDED(m_context->Map(m_fsCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &map)) && map.pData) {
             float* p = reinterpret_cast<float*>(map.pData);
-            p[0] = 0.0f; p[1] = 0.0f; p[2] = 1.0f; p[3] = 1.0f;
+            p[0] = uvOffsetX;
+            p[1] = uvOffsetY;
+            p[2] = uvScaleX;
+            p[3] = uvScaleY;
             m_context->Unmap(m_fsCB, 0);
         }
         ID3D11Buffer* cbs[1] = { m_fsCB };
@@ -677,7 +787,13 @@ namespace {
         desc.Height = height;
         desc.MipLevels = 1;
         desc.ArraySize = 1;
-        desc.BindFlags |= D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+        // Match the input format so we can copy back into the game's color buffers safely
+        // (engine-copy path requires identical formats for CopySubresourceRegion)
+        desc.Format = inputDesc.Format;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        // Ensure non-MSAA output
+        desc.SampleDesc.Count = 1;
+        desc.BindFlags |= D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET;
         desc.BindFlags &= ~(D3D11_BIND_DEPTH_STENCIL);
         desc.MiscFlags &= ~(D3D11_RESOURCE_MISC_SHARED);
 
@@ -910,6 +1026,20 @@ bool DLSSManager::EnsureZeroDepthTexture(uint32_t width, uint32_t height) {
 void DLSSManager::ReleaseEyeRender(EyeContext& eye) {
     if (eye.renderColorRTV) { eye.renderColorRTV->Release(); eye.renderColorRTV = nullptr; }
     if (eye.renderColor) { eye.renderColor->Release(); eye.renderColor = nullptr; }
+    if (eye.renderDepthRTV) { eye.renderDepthRTV->Release(); eye.renderDepthRTV = nullptr; }
+    if (eye.renderMotionRTV) { eye.renderMotionRTV->Release(); eye.renderMotionRTV = nullptr; }
+    ReleaseEyeAuxiliary(eye);
+}
+
+void DLSSManager::ReleaseEyeAuxiliary(EyeContext& eye) {
+#if USE_STREAMLINE
+    if (eye.renderDepthSRV) { eye.renderDepthSRV->Release(); eye.renderDepthSRV = nullptr; }
+    if (eye.renderDepth) { eye.renderDepth->Release(); eye.renderDepth = nullptr; }
+    if (eye.renderMotionSRV) { eye.renderMotionSRV->Release(); eye.renderMotionSRV = nullptr; }
+    if (eye.renderMotion) { eye.renderMotion->Release(); eye.renderMotion = nullptr; }
+#else
+    (void)eye;
+#endif
 }
 
 bool DLSSManager::EnsureDownscaleShaders() {
@@ -929,7 +1059,9 @@ bool DLSSManager::EnsureDownscaleShaders() {
     SamplerState samLinear:register(s0);
     float4 main(float4 pos:SV_Position, float2 uv:TEX):SV_Target{
         float2 suv = gUVOffset + uv * gUVScale;
-        return srcTex.Sample(samLinear, suv);
+        float4 c = srcTex.Sample(samLinear, suv);
+        c.a = 1.0f; // ensure opaque alpha
+        return c;
     })";
     ID3DBlob* vsBlob=nullptr; ID3DBlob* psBlob=nullptr; ID3DBlob* err=nullptr;
     HRESULT hr = D3DCompile(vsSrc, strlen(vsSrc), nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0, &vsBlob, &err);
@@ -954,41 +1086,134 @@ bool DLSSManager::EnsureDownscaleShaders() {
     return true;
 }
 
-bool DLSSManager::DownscaleToRender(EyeContext& eye,
+bool DLSSManager::DownscaleToRender(ID3D11Texture2D*& targetTexture,
+                                    ID3D11RenderTargetView*& targetRTV,
+                                    DXGI_FORMAT targetFormat,
                                     ID3D11Texture2D* inputTexture,
                                     uint32_t renderWidth,
                                     uint32_t renderHeight,
                                     float uvOffsetX,
                                     float uvOffsetY,
                                     float uvScaleX,
-                                    float uvScaleY) {
+                                    float uvScaleY,
+                                    bool* outTextureRecreated,
+                                    ID3D11ShaderResourceView** outTargetSRV,
+                                    const char* debugLabel) {
     if (!EnsureDownscaleShaders()) return false;
     if (!inputTexture) return false;
-    D3D11_TEXTURE2D_DESC inDesc{}; inputTexture->GetDesc(&inDesc);
-    // Ensure render target
-    if (!eye.renderColor || eye.renderWidth != renderWidth || eye.renderHeight != renderHeight) {
-        ReleaseEyeRender(eye);
-        D3D11_TEXTURE2D_DESC td = {};
+    D3D11_TEXTURE2D_DESC inputDesc = {};
+    inputTexture->GetDesc(&inputDesc);
+    const char* label = debugLabel ? debugLabel : "resample";
+
+    bool recreated = false;
+    if (!targetTexture) {
+        recreated = true;
+    } else {
+        D3D11_TEXTURE2D_DESC existing{};
+        targetTexture->GetDesc(&existing);
+        if (existing.Width != renderWidth || existing.Height != renderHeight ||
+            existing.Format != targetFormat) {
+            recreated = true;
+        }
+    }
+
+    if (recreated) {
+        if (targetTexture) targetTexture->Release();
+        if (targetRTV) targetRTV->Release();
+        D3D11_TEXTURE2D_DESC td = inputDesc;
         td.Width = renderWidth; td.Height = renderHeight; td.MipLevels = 1; td.ArraySize = 1;
-        td.Format = inDesc.Format;
-        td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
+        td.Format = targetFormat;
+        td.SampleDesc.Count = 1; td.SampleDesc.Quality = 0;
+        td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(m_device->CreateTexture2D(&td, nullptr, &eye.renderColor))) return false;
-        if (FAILED(m_device->CreateRenderTargetView(eye.renderColor, nullptr, &eye.renderColorRTV))) return false;
-        eye.renderWidth = renderWidth; eye.renderHeight = renderHeight;
-        eye.requiresReset = true;
+        td.CPUAccessFlags = 0;
+        td.MiscFlags = 0;
+        if (FAILED(m_device->CreateTexture2D(&td, nullptr, &targetTexture))) {
+            targetTexture = nullptr;
+            targetRTV = nullptr;
+            if (outTextureRecreated) *outTextureRecreated = false;
+            _ERROR("[DLSS][Downscale:%s] Failed to create target texture (%ux%u fmt=%u)", label, renderWidth, renderHeight, static_cast<unsigned>(targetFormat));
+            return false;
+        }
+        if (FAILED(m_device->CreateRenderTargetView(targetTexture, nullptr, &targetRTV))) {
+            targetTexture->Release();
+            targetTexture = nullptr;
+            targetRTV = nullptr;
+            if (outTextureRecreated) *outTextureRecreated = false;
+            _ERROR("[DLSS][Downscale:%s] Failed to create RTV for target texture", label);
+            return false;
+        }
+        if (outTargetSRV && *outTargetSRV) {
+            (*outTargetSRV)->Release();
+            *outTargetSRV = nullptr;
+        }
+        _MESSAGE("[DLSS][Downscale:%s] Target reallocated -> %ux%u fmt=%u", label, renderWidth, renderHeight, static_cast<unsigned>(targetFormat));
+    }
+
+    if (outTargetSRV && (recreated || *outTargetSRV == nullptr) && targetTexture) {
+        D3D11_TEXTURE2D_DESC targetDesc{};
+        targetTexture->GetDesc(&targetDesc);
+        D3D11_SHADER_RESOURCE_VIEW_DESC targetSrvDesc{};
+        targetSrvDesc.Format = targetFormat;
+        if (targetDesc.SampleDesc.Count > 1) {
+            targetSrvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS;
+        } else {
+            targetSrvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            targetSrvDesc.Texture2D.MostDetailedMip = 0;
+            targetSrvDesc.Texture2D.MipLevels = 1;
+        }
+        if (FAILED(m_device->CreateShaderResourceView(targetTexture, &targetSrvDesc, outTargetSRV))) {
+            if (outTextureRecreated) *outTextureRecreated = recreated;
+            _ERROR("[DLSS][Downscale:%s] Failed to create SRV for target texture", label);
+            return false;
+        }
     }
 
     // Create SRV for input (or copied input if not SRV-bindable)
     ID3D11ShaderResourceView* inSRV = nullptr;
-    HRESULT hr = m_device->CreateShaderResourceView(inputTexture, nullptr, &inSRV);
+    auto createSRVForTexture = [&](ID3D11Texture2D* tex) -> ID3D11ShaderResourceView* {
+        if (!tex) return nullptr;
+        D3D11_TEXTURE2D_DESC desc{};
+        tex->GetDesc(&desc);
+        DXGI_FORMAT srvFormat = ResolveSRVFormat(desc.Format);
+        if (srvFormat == DXGI_FORMAT_UNKNOWN) {
+            srvFormat = desc.Format;
+        }
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+        srvDesc.Format = srvFormat;
+        if (desc.SampleDesc.Count > 1) {
+            srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS;
+        } else {
+            srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.Texture2D.MostDetailedMip = 0;
+            srvDesc.Texture2D.MipLevels = 1;
+        }
+        ID3D11ShaderResourceView* srv = nullptr;
+        if (FAILED(m_device->CreateShaderResourceView(tex, &srvDesc, &srv))) {
+            return nullptr;
+        }
+        return srv;
+    };
+
+    inSRV = createSRVForTexture(inputTexture);
     ID3D11Texture2D* tempCopy = nullptr;
-    if (FAILED(hr) || !inSRV) {
+    if (!inSRV) {
         // Make a copy with SRV bind
-        D3D11_TEXTURE2D_DESC cd = inDesc; cd.BindFlags |= D3D11_BIND_SHADER_RESOURCE; cd.Usage = D3D11_USAGE_DEFAULT; cd.MipLevels = 1; cd.ArraySize = 1;
-        if (FAILED(m_device->CreateTexture2D(&cd, nullptr, &tempCopy))) return false;
+        D3D11_TEXTURE2D_DESC cd = inputDesc; cd.BindFlags |= D3D11_BIND_SHADER_RESOURCE; cd.Usage = D3D11_USAGE_DEFAULT;
+        cd.MipLevels = 1; cd.ArraySize = 1;
+        if (FAILED(m_device->CreateTexture2D(&cd, nullptr, &tempCopy))) {
+            if (outTextureRecreated) *outTextureRecreated = recreated;
+            _ERROR("[DLSS][Downscale:%s] Failed to create temp copy for SRV binding", label);
+            return false;
+        }
         m_context->CopyResource(tempCopy, inputTexture);
-        if (FAILED(m_device->CreateShaderResourceView(tempCopy, nullptr, &inSRV))) { tempCopy->Release(); return false; }
+        inSRV = createSRVForTexture(tempCopy);
+        if (!inSRV) {
+            tempCopy->Release();
+            if (outTextureRecreated) *outTextureRecreated = recreated;
+            _ERROR("[DLSS][Downscale:%s] Failed to create SRV for source texture", label);
+            return false;
+        }
     }
 
     // Save state (minimal)
@@ -1002,16 +1227,15 @@ bool DLSSManager::DownscaleToRender(EyeContext& eye,
     ID3D11ShaderResourceView* oldSRV = nullptr; m_context->PSGetShaderResources(0, 1, &oldSRV);
     ID3D11SamplerState* oldSamp = nullptr; m_context->PSGetSamplers(0, 1, &oldSamp);
 
-    // Set viewport and render target
+    // Set viewport and RT
     D3D11_VIEWPORT vp{}; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)renderWidth; vp.Height = (float)renderHeight; vp.MinDepth = 0; vp.MaxDepth = 1;
     m_context->RSSetViewports(1, &vp);
-    m_context->OMSetRenderTargets(1, &eye.renderColorRTV, nullptr);
+    m_context->OMSetRenderTargets(1, &targetRTV, nullptr);
 
-    // Bind pipeline
+    // Bind FS pipeline
     m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_context->VSSetShader(m_fsVS, nullptr, 0);
     m_context->PSSetShader(m_fsPS, nullptr, 0);
-    // Update constant buffer
     if (m_fsCB) {
         D3D11_MAPPED_SUBRESOURCE map{};
         if (SUCCEEDED(m_context->Map(m_fsCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &map)) && map.pData) {
@@ -1026,11 +1250,10 @@ bool DLSSManager::DownscaleToRender(EyeContext& eye,
     m_context->PSSetSamplers(0, 1, &m_linearSampler);
     m_context->Draw(3, 0);
 
-    // Unbind
+    // Unbind and restore
     ID3D11ShaderResourceView* nullSRV[1] = { nullptr };
     m_context->PSSetShaderResources(0, 1, nullSRV);
 
-    // Restore state
     m_context->OMSetRenderTargets(1, &oldRTV, oldDSV);
     if (oldRTV) oldRTV->Release(); if (oldDSV) oldDSV->Release();
     m_context->RSSetViewports(vpCount, &oldVP);
@@ -1040,9 +1263,13 @@ bool DLSSManager::DownscaleToRender(EyeContext& eye,
     if (oldVS) oldVS->Release(); if (oldPS) oldPS->Release();
     if (oldSRV) { ID3D11ShaderResourceView* r[1] = { oldSRV }; m_context->PSSetShaderResources(0, 1, r); oldSRV->Release(); }
     if (oldSamp) { ID3D11SamplerState* s[1] = { oldSamp }; m_context->PSSetSamplers(0, 1, s); oldSamp->Release(); }
-    if (inSRV) inSRV->Release(); if (tempCopy) tempCopy->Release();
+    if (inSRV) inSRV->Release();
+    if (tempCopy) tempCopy->Release();
+    if (outTextureRecreated) *outTextureRecreated = recreated;
     return true;
 }
+
+
 
 ID3D11Texture2D* DLSSManager::ProcessEye(EyeContext& eye,
                                          ID3D11Texture2D* inputTexture,
@@ -1062,6 +1289,13 @@ ID3D11Texture2D* DLSSManager::ProcessEye(EyeContext& eye,
 
     // Determine per-eye display size from VR Submit (preferred), fallback to simple atlas split
     const bool isLeftEye = (&eye == &m_leftEye);
+    DLSSM_TRACE_SAMPLED(60,
+                        "ProcessEye enter eye=%s input=%p depth=%p motion=%p forceReset=%d",
+                        isLeftEye ? "L" : "R",
+                        inputTexture,
+                        depthTexture,
+                        motionVectors,
+                        forceReset ? 1 : 0);
     uint32_t perEyeOutW = 0, perEyeOutH = 0;
     if (!DLSSHooks::GetPerEyeDisplaySize(isLeftEye ? 0 : 1, perEyeOutW, perEyeOutH)) {
         if (inputDesc.Width >= inputDesc.Height) { // side-by-side fallback
@@ -1116,42 +1350,115 @@ ID3D11Texture2D* DLSSManager::ProcessEye(EyeContext& eye,
     if (renderWidth > perEyeOutW)  renderWidth = perEyeOutW;
     if (renderHeight > perEyeOutH) renderHeight = perEyeOutH;
 
+    float uvOffsetX = 0.0f;
+    float uvOffsetY = 0.0f;
+    float uvScaleX = 1.0f;
+    float uvScaleY = 1.0f;
+    const bool likelySxS = (inputDesc.Width >= (perEyeOutW * 2u - 8u)) && (inputDesc.Width >= inputDesc.Height);
+    const bool likelyTB  = (!likelySxS) && (inputDesc.Height >= (perEyeOutH * 2u - 8u));
+    if (likelySxS) {
+        uvScaleX = 0.5f; uvScaleY = 1.0f;
+        uvOffsetX = isLeftEye ? 0.0f : 0.5f; uvOffsetY = 0.0f;
+    } else if (likelyTB) {
+        uvScaleX = 1.0f; uvScaleY = 0.5f;
+        uvOffsetX = 0.0f; uvOffsetY = isLeftEye ? 0.0f : 0.5f;
+    }
+
+    auto DownscaleAuxResource = [&](ID3D11Texture2D* source,
+                                    DXGI_FORMAT targetFormat,
+                                    ID3D11Texture2D*& cacheTex,
+                                    ID3D11RenderTargetView*& cacheRTV,
+                                    ID3D11ShaderResourceView*& cacheSRV,
+                                    const char* label) -> ID3D11Texture2D* {
+        if (!source || renderWidth == 0 || renderHeight == 0) {
+            return nullptr;
+        }
+        bool recreatedAux = false;
+        if (!DownscaleToRender(cacheTex,
+                               cacheRTV,
+                               targetFormat,
+                               source,
+                               renderWidth,
+                               renderHeight,
+                               uvOffsetX,
+                               uvOffsetY,
+                               uvScaleX,
+                               uvScaleY,
+                               &recreatedAux,
+                               &cacheSRV,
+                               label)) {
+            if (LogOnce(label)) {
+                _ERROR("[DLSS] Downscale failed for %s; source will be ignored", label ? label : "aux");
+            }
+            return nullptr;
+        }
+        return cacheTex;
+    };
+
+    const std::string depthLabel = std::string("depth-") + (isLeftEye ? "left" : "right");
+    ID3D11Texture2D* renderDepthTex = nullptr;
+    if (depthTexture) {
+        renderDepthTex = DownscaleAuxResource(depthTexture,
+                                              GetDepthTargetFormat(),
+                                              eye.renderDepth,
+                                              eye.renderDepthRTV,
+                                              eye.renderDepthSRV,
+                                              depthLabel.c_str());
+    }
+
+    const std::string motionLabel = std::string("motion-") + (isLeftEye ? "left" : "right");
+    ID3D11Texture2D* renderMotionTex = nullptr;
+    if (motionVectors) {
+        renderMotionTex = DownscaleAuxResource(motionVectors,
+                                               GetMotionTargetFormat(),
+                                               eye.renderMotion,
+                                               eye.renderMotionRTV,
+                                               eye.renderMotionSRV,
+                                               motionLabel.c_str());
+    }
+    DLSSM_TRACE_SAMPLED(60,
+                        "ProcessEye resources eye=%s color=%p depth=%p motion=%p",
+                        isLeftEye ? "L" : "R",
+                        eye.renderColor,
+                        renderDepthTex ? renderDepthTex : depthTexture,
+                        renderMotionTex ? renderMotionTex : motionVectors);
+
+    if (depthTexture && !renderDepthTex) {
+        std::string failTag = std::string("depth-fail-") + (isLeftEye ? "L" : "R");
+        if (LogOnce(failTag.c_str())) {
+            _ERROR("[DLSS] Failed to prepare render-sized depth for %s eye; using fallback", isLeftEye ? "left" : "right");
+        }
+    }
+    if (motionVectors && !renderMotionTex) {
+        std::string failTag = std::string("motion-fail-") + (isLeftEye ? "L" : "R");
+        if (LogOnce(failTag.c_str())) {
+            _ERROR("[DLSS] Failed to prepare render-sized motion for %s eye; using fallback", isLeftEye ? "left" : "right");
+        }
+    }
+
     // Streamline path (no NGX params required)
     if (m_backend && m_backend->IsReady()) {
 #if USE_STREAMLINE
         if (m_slBackend) {
             m_slBackend->SetCurrentEyeIndex(isLeftEye ? 0 : 1);
-            if (isLeftEye) {
-                m_slBackend->BeginFrame();
-            }
         }
 #endif
-        _MESSAGE("[SL] ProcessEye: rw=%u rh=%u ow=%u oh=%u depth=%d mv=%d reset=%d",
-                 renderWidth, renderHeight, perEyeOutW, perEyeOutH,
-                 depthTexture?1:0, motionVectors?1:0, (eye.requiresReset||forceReset)?1:0);
-        // Decide crop window for per-eye region when game uses stereo atlas
-        float uvOffsetX = 0.0f, uvOffsetY = 0.0f, uvScaleX = 1.0f, uvScaleY = 1.0f;
-        const bool likelySxS = (inputDesc.Width >= (perEyeOutW * 2u - 8u)) && (inputDesc.Width >= inputDesc.Height);
-        const bool likelyTB  = (!likelySxS) && (inputDesc.Height >= (perEyeOutH * 2u - 8u));
-        if (likelySxS) {
-            uvScaleX = 0.5f; uvScaleY = 1.0f;
-            uvOffsetX = isLeftEye ? 0.0f : 0.5f; uvOffsetY = 0.0f;
-        } else if (likelyTB) {
-            uvScaleX = 1.0f; uvScaleY = 0.5f;
-            uvOffsetX = 0.0f; uvOffsetY = isLeftEye ? 0.0f : 0.5f;
+        if (ShouldLogSampledEvent()) {
+            _MESSAGE("[SL] ProcessEye: rw=%u rh=%u ow=%u oh=%u depth=%d mv=%d reset=%d",
+                     renderWidth, renderHeight, perEyeOutW, perEyeOutH,
+                     renderDepthTex ? 1 : (depthTexture ? 1 : 0),
+                     renderMotionTex ? 1 : (motionVectors ? 1 : 0),
+                     (eye.requiresReset || forceReset) ? 1 : 0);
         }
-
-        // If input already matches render size and no cropping is needed, skip blit
-        bool useInputDirect = (uvScaleX == 1.0f && uvScaleY == 1.0f && inputDesc.Width == renderWidth && inputDesc.Height == renderHeight);
-        if (useInputDirect) {
-            eye.renderWidth = renderWidth;
-            eye.renderHeight = renderHeight;
-            eye.requiresReset = true; // first time with direct-path
-        } else {
-            // Downscale/crop input color to render size
-            if (!DownscaleToRender(eye, inputTexture, renderWidth, renderHeight, uvOffsetX, uvOffsetY, uvScaleX, uvScaleY)) {
-                return inputTexture;
-            }
+        bool colorRecreated = false;
+        const std::string colorLabel = std::string("color-") + (isLeftEye ? "left" : "right");
+        if (!DownscaleToRender(eye.renderColor, eye.renderColorRTV, inputDesc.Format, inputTexture, renderWidth, renderHeight, uvOffsetX, uvOffsetY, uvScaleX, uvScaleY, &colorRecreated, nullptr, colorLabel.c_str())) {
+            return inputTexture;
+        }
+        eye.renderWidth = renderWidth;
+        eye.renderHeight = renderHeight;
+        if (colorRecreated) {
+            eye.requiresReset = true;
         }
 
         // Ensure output texture for the desired per-eye output dimensions
@@ -1171,83 +1478,160 @@ ID3D11Texture2D* DLSSManager::ProcessEye(EyeContext& eye,
         }
 
         // Provide motion vectors (fallback to zero-MV if missing)
-        ID3D11Texture2D* mv = motionVectors;
+        ID3D11Texture2D* mv = renderMotionTex;
+        if (!mv && motionVectors) {
+            D3D11_TEXTURE2D_DESC mvDesc{}; motionVectors->GetDesc(&mvDesc);
+            if (mvDesc.Width == renderWidth && mvDesc.Height == renderHeight && mvDesc.SampleDesc.Count == 1) {
+                mv = motionVectors;
+            }
+        }
         if (!mv) {
             if (EnsureZeroMotionVectors(renderWidth, renderHeight) && m_zeroMotionVectors) {
                 mv = m_zeroMotionVectors;
+                std::string tag = std::string("sl-zero-mv-") + (isLeftEye ? "L" : "R");
+                if (LogOnce(tag.c_str())) {
+                    _MESSAGE("[DLSS][SL] Using zero motion vectors for %s eye (missing or invalid source)", isLeftEye ? "left" : "right");
+                }
             }
         }
 
         // Validate depth dimensions (must match render size)
-        ID3D11Texture2D* depthForDlss = depthTexture;
-        if (depthForDlss) {
-            D3D11_TEXTURE2D_DESC dd{}; depthForDlss->GetDesc(&dd);
-            if (dd.Width != renderWidth || dd.Height != renderHeight || dd.SampleDesc.Count != 1) {
-                depthForDlss = nullptr;
+        ID3D11Texture2D* depthForDlss = renderDepthTex;
+        if (!depthForDlss && depthTexture) {
+            D3D11_TEXTURE2D_DESC dd{}; depthTexture->GetDesc(&dd);
+            if (dd.Width == renderWidth && dd.Height == renderHeight && dd.SampleDesc.Count == 1) {
+                depthForDlss = depthTexture;
             }
         }
         if (!depthForDlss) {
             if (EnsureZeroDepthTexture(renderWidth, renderHeight) && m_zeroDepthTexture) {
                 depthForDlss = m_zeroDepthTexture;
+                std::string tag = std::string("sl-zero-depth-") + (isLeftEye ? "L" : "R");
+                if (LogOnce(tag.c_str())) {
+                    _MESSAGE("[DLSS][SL] Using zero depth for %s eye (missing or invalid source)", isLeftEye ? "left" : "right");
+                }
             }
         }
 
-        ID3D11Texture2D* colorForBackend = useInputDirect ? inputTexture : eye.renderColor;
+        ID3D11Texture2D* colorForBackend = eye.renderColor ? eye.renderColor : inputTexture;
         ID3D11Texture2D* out = m_backend->ProcessEye(colorForBackend, depthForDlss, mv, eye.outputTexture,
                                                      renderWidth, renderHeight,
                                                      perEyeOutW, perEyeOutH,
                                                      (eye.requiresReset || forceReset));
+        DLSSM_TRACE_SAMPLED(60,
+                            "ProcessEye SL eye=%s color=%p depth=%p motion=%p outTex=%p",
+                            isLeftEye ? "L" : "R",
+                            colorForBackend,
+                            depthForDlss,
+                            mv,
+                            out);
         eye.requiresReset = false;
         // Treat success only when backend returns the designated output texture
         ID3D11Texture2D* result = (out == eye.outputTexture) ? out : inputTexture;
-#if USE_STREAMLINE
-        if (m_slBackend && !isLeftEye) {
-            m_slBackend->EndFrame();
-        }
-#endif
+        DLSSM_TRACE_SAMPLED(60,
+                            "ProcessEye SL result eye=%s returning=%p (match=%d)",
+                            isLeftEye ? "L" : "R",
+                            result,
+                            result == eye.outputTexture ? 1 : 0);
         return result;
     }
 
-    // NGX fallback path
-    // Ensure feature and output texture exist for the target resolution.
-    if (!EnsureEyeFeature(eye, inputTexture, renderWidth, renderHeight, inputDesc.Width, inputDesc.Height)) {
+    // NGX fallback path — PureDark-style per-eye processing
+    // Ensure feature and output texture exist for the per-eye target resolution.
+    if (!EnsureEyeFeature(eye, inputTexture, renderWidth, renderHeight, perEyeOutW, perEyeOutH)) {
         return inputTexture;
+    }
+
+    // If input already matches render size and no cropping is needed, skip blit
+    bool useInputDirect = (uvScaleX == 1.0f && uvScaleY == 1.0f &&
+                           inputDesc.Width == renderWidth && inputDesc.Height == renderHeight);
+    bool colorRecreatedNgx = false;
+    const std::string colorLabelNgx = std::string("ngx-color-") + (isLeftEye ? "left" : "right");
+    if (!useInputDirect) {
+        if (!DownscaleToRender(
+                eye.renderColor,
+                eye.renderColorRTV,
+                inputDesc.Format,
+                inputTexture,
+                renderWidth,
+                renderHeight,
+                uvOffsetX,
+                uvOffsetY,
+                uvScaleX,
+                uvScaleY,
+                &colorRecreatedNgx,
+                nullptr,
+                colorLabelNgx.c_str())) {
+            return inputTexture;
+        }
+        eye.renderWidth = renderWidth;
+        eye.renderHeight = renderHeight;
+        if (colorRecreatedNgx) {
+            eye.requiresReset = true;
+        }
+    } else {
+        eye.renderWidth = renderWidth;
+        eye.renderHeight = renderHeight;
+        eye.requiresReset = true;
     }
 
     m_ngxParameters->Reset();
     m_ngxParameters->Set(NVSDK_NGX_Parameter_Width, renderWidth);
     m_ngxParameters->Set(NVSDK_NGX_Parameter_Height, renderHeight);
-    m_ngxParameters->Set(NVSDK_NGX_Parameter_OutWidth, inputDesc.Width);
-    m_ngxParameters->Set(NVSDK_NGX_Parameter_OutHeight, inputDesc.Height);
+    m_ngxParameters->Set(NVSDK_NGX_Parameter_OutWidth, perEyeOutW);
+    m_ngxParameters->Set(NVSDK_NGX_Parameter_OutHeight, perEyeOutH);
     m_ngxParameters->Set(NVSDK_NGX_Parameter_PerfQualityValue, static_cast<unsigned int>(MapQuality(m_quality)));
     m_ngxParameters->Set(NVSDK_NGX_Parameter_Sharpness, m_sharpeningEnabled ? m_sharpness : 0.0f);
     m_ngxParameters->Set(NVSDK_NGX_Parameter_Reset, (eye.requiresReset || forceReset) ? 1 : 0);
 
-    m_ngxParameters->Set(NVSDK_NGX_Parameter_Color, static_cast<ID3D11Resource*>(inputTexture));
+    ID3D11Texture2D* colorForNgx = useInputDirect ? inputTexture : eye.renderColor;
+    m_ngxParameters->Set(NVSDK_NGX_Parameter_Color, static_cast<ID3D11Resource*>(colorForNgx));
     m_ngxParameters->Set(NVSDK_NGX_Parameter_Output, static_cast<ID3D11Resource*>(eye.outputTexture));
 
-    if (motionVectors) {
-        m_ngxParameters->Set(NVSDK_NGX_Parameter_MotionVectors, static_cast<ID3D11Resource*>(motionVectors));
-    } else {
+    ID3D11Texture2D* motionForNgx = renderMotionTex;
+    if (!motionForNgx && motionVectors) {
+        D3D11_TEXTURE2D_DESC mvDesc{}; motionVectors->GetDesc(&mvDesc);
+        if (mvDesc.Width == renderWidth && mvDesc.Height == renderHeight && mvDesc.SampleDesc.Count == 1) {
+            motionForNgx = motionVectors;
+        }
+    }
+    if (!motionForNgx) {
         if (EnsureZeroMotionVectors(renderWidth, renderHeight) && m_zeroMotionVectors) {
-            m_ngxParameters->Set(NVSDK_NGX_Parameter_MotionVectors, static_cast<ID3D11Resource*>(m_zeroMotionVectors));
-        } else {
-            m_ngxParameters->Set(NVSDK_NGX_Parameter_MotionVectors, static_cast<ID3D11Resource*>(nullptr));
+            motionForNgx = m_zeroMotionVectors;
+            std::string tag = std::string("ngx-zero-mv-") + (isLeftEye ? "L" : "R");
+            if (LogOnce(tag.c_str())) {
+                _MESSAGE("[DLSS][NGX] Using zero motion vectors for %s eye", isLeftEye ? "left" : "right");
+            }
         }
     }
+    m_ngxParameters->Set(NVSDK_NGX_Parameter_MotionVectors, static_cast<ID3D11Resource*>(motionForNgx));
 
-    if (depthTexture) {
-        m_ngxParameters->Set(NVSDK_NGX_Parameter_Depth, static_cast<ID3D11Resource*>(depthTexture));
-    } else {
-        ID3D11Texture2D* zeroDepth = nullptr;
+    // Validate depth dimensions (must match render size); else use zero depth
+    ID3D11Texture2D* depthForDlss = renderDepthTex;
+    if (!depthForDlss && depthTexture) {
+        D3D11_TEXTURE2D_DESC dd{}; depthTexture->GetDesc(&dd);
+        if (dd.Width == renderWidth && dd.Height == renderHeight && dd.SampleDesc.Count == 1) {
+            depthForDlss = depthTexture;
+        }
+    }
+    if (!depthForDlss) {
         if (EnsureZeroDepthTexture(renderWidth, renderHeight)) {
-            zeroDepth = m_zeroDepthTexture;
+            depthForDlss = m_zeroDepthTexture;
+            std::string tag = std::string("ngx-zero-depth-") + (isLeftEye ? "L" : "R");
+            if (LogOnce(tag.c_str())) {
+                _MESSAGE("[DLSS][NGX] Using zero depth for %s eye", isLeftEye ? "left" : "right");
+            }
         }
-        m_ngxParameters->Set(NVSDK_NGX_Parameter_Depth, static_cast<ID3D11Resource*>(zeroDepth));
     }
+    m_ngxParameters->Set(NVSDK_NGX_Parameter_Depth, static_cast<ID3D11Resource*>(depthForDlss));
 
-    _MESSAGE("[NGX] Evaluate: rw=%u rh=%u ow=%u oh=%u depth=%d mv=%d reset=%d",
-             renderWidth, renderHeight, inputDesc.Width, inputDesc.Height, depthTexture?1:0, motionVectors?1:0, (eye.requiresReset||forceReset)?1:0);
+    if (ShouldLogSampledEvent()) {
+        _MESSAGE("[NGX] Evaluate: rw=%u rh=%u ow=%u oh=%u depth=%d mv=%d reset=%d",
+                 renderWidth, renderHeight, perEyeOutW, perEyeOutH,
+                 depthForDlss ? 1 : 0,
+                 motionForNgx ? 1 : 0,
+                 (eye.requiresReset || forceReset) ? 1 : 0);
+    }
     NVSDK_NGX_Result result = g_pfnNGXEvaluateFeature(m_context, eye.dlssHandle, m_ngxParameters, nullptr);
     if (!NVSDK_NGX_SUCCEED(result)) {
         _ERROR("NVSDK_NGX_D3D11_EvaluateFeature failed: 0x%08X", result);
@@ -1256,6 +1640,10 @@ ID3D11Texture2D* DLSSManager::ProcessEye(EyeContext& eye,
     }
 
     eye.requiresReset = false;
+    DLSSM_TRACE_SAMPLED(60,
+                        "ProcessEye NGX result eye=%s outTex=%p",
+                        isLeftEye ? "L" : "R",
+                        eye.outputTexture ? eye.outputTexture : inputTexture);
     return eye.outputTexture ? eye.outputTexture : inputTexture;
 }
 

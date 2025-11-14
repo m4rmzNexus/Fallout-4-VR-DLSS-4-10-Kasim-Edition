@@ -81,7 +81,12 @@ private:
     ImageWrapper transparentMask;
     ImageWrapper opaqueColor;
     ImageWrapper outputBuffer;
-    
+
+    ID3D11Texture2D* depthCopyTexture = nullptr;
+    ID3D11Texture2D* motionVectorCopyTexture = nullptr;
+    ID3D11Texture2D* CopyTextureToSRV(ID3D11Texture2D* source, ID3D11Texture2D*& cache, bool* outRecreated = nullptr);
+    void ReleaseCopyTexture(ID3D11Texture2D*& cache);
+
     // DLSS specific
     void* dlssHandle = nullptr;
     bool dlssInitialized = false;

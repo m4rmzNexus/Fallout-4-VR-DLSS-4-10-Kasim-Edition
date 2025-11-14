@@ -34,6 +34,11 @@ namespace DLSSHooks {
     extern PFN_CreateDeferredContext RealCreateDeferredContext;
     HRESULT STDMETHODCALLTYPE HookedCreateDeferredContext(ID3D11Device* device, UINT ContextFlags, ID3D11DeviceContext** ppDeferredContext);
 
+    // Sampler hook for Mip LOD Bias
+    typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateSamplerState)(ID3D11Device* device, const D3D11_SAMPLER_DESC* pDesc, ID3D11SamplerState** ppSamplerState);
+    extern PFN_CreateSamplerState RealCreateSamplerState;
+    HRESULT STDMETHODCALLTYPE HookedCreateSamplerState(ID3D11Device* device, const D3D11_SAMPLER_DESC* pDesc, ID3D11SamplerState** ppSamplerState);
+
     // DXGI Factory early hook to observe swapchain creation
     typedef HRESULT(STDMETHODCALLTYPE* PFN_FactoryCreateSwapChain)(IDXGIFactory* factory, IUnknown* pDevice, DXGI_SWAP_CHAIN_DESC* pDesc, IDXGISwapChain** ppSwapChain);
     extern PFN_FactoryCreateSwapChain RealFactoryCreateSwapChain;
@@ -47,7 +52,10 @@ namespace DLSSHooks {
     void STDMETHODCALLTYPE HookedRSSetViewports(ID3D11DeviceContext* ctx, UINT count, const D3D11_VIEWPORT* viewports);
     void STDMETHODCALLTYPE HookedOMSetRenderTargets(ID3D11DeviceContext* ctx, UINT numRTVs, ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV);
 
-    void RegisterMotionVectorTexture(ID3D11Texture2D* motionTexture);
+    void RegisterMotionVectorTexture(ID3D11Texture2D* motionTexture,
+                                     const D3D11_TEXTURE2D_DESC* desc = nullptr,
+                                     UINT targetWidth = 0,
+                                     UINT targetHeight = 0);
     void RegisterFallbackDepthTexture(ID3D11Texture2D* depthTexture,
                                       const D3D11_TEXTURE2D_DESC* desc = nullptr,
                                       UINT targetWidth = 0,

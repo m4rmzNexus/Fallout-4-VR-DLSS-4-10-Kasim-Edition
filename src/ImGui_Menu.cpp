@@ -13,6 +13,7 @@
 #include "F4SEVR_Upscaler.h"
 #include "dlss_manager.h"
 #include "dlss_config.h"
+#include "LogUtils.h"
 
 extern DLSSManager* g_dlssManager;
 extern DLSSConfig* g_dlssConfig;
@@ -66,6 +67,9 @@ private:
     int  earlyDlssModeSetting = 0; // 0=viewport clamp, 1=rt_redirect
     bool debugEarlyDlssSetting = false;
 
+    // Backend selection
+    bool streamlineOnlySetting = false; // SL only (no NGX fallback)
+
     HotkeyBinding menuHotkey{VK_END, false};
     HotkeyBinding toggleHotkey{VK_MULTIPLY, false};
     HotkeyBinding cycleQualityHotkey{VK_HOME, false};
@@ -92,10 +96,8 @@ public:
         SyncFromConfig();
         UpdateHotkeyBindings();
 
-        if (FILE* log = fopen("F4SEVR_DLSS.log", "a")) {
-            fprintf(log, "ImGui Menu initialized\n");
-            fclose(log);
-        }
+        // Log to Documents path
+        LogUtils::Logf("ImGui Menu initialized");
 
         return true;
     }
@@ -134,19 +136,22 @@ public:
         earlyDlssEnabledSetting = g_dlssConfig->earlyDlssEnabled;
         earlyDlssModeSetting = g_dlssConfig->earlyDlssMode;
         debugEarlyDlssSetting = g_dlssConfig->debugEarlyDlss;
+        streamlineOnlySetting = g_dlssConfig->streamlineOnly;
 
         hotkeysDirty = true;
     }
 
     void ToggleMenu() {
+        bool wasVisible = menuVisible;
         menuVisible = !menuVisible;
         if (ImGui::GetCurrentContext()) {
             ImGui::GetIO().MouseDrawCursor = menuVisible;
         }
 
-        if (FILE* log = fopen("F4SEVR_DLSS.log", "a")) {
-            fprintf(log, "Menu toggled: %s\n", menuVisible ? "ON" : "OFF");
-            fclose(log);
+        LogUtils::Logf("Menu toggled: %s", menuVisible ? "ON" : "OFF");
+        // Auto-save when closing the menu so GUI changes persist without explicit Save
+        if (wasVisible && !menuVisible) {
+            WriteSettingsToConfig(true);
         }
     }
 
@@ -247,6 +252,9 @@ public:
                 }
                 if (ImGui::Checkbox("Debug logs (low rate)", &debugEarlyDlssSetting)) {
                     WriteSettingsToConfig(true);
+                }
+                if (ImGui::Checkbox("Backend: Streamline only (disable NGX fallback)", &streamlineOnlySetting)) {
+                    ApplyBackendSettings();
                 }
                 ImGui::Separator();
                 ImGui::TextDisabled("Note: Phase 0 instrumentation only (no behavior change).");
@@ -536,13 +544,28 @@ private:
         g_dlssConfig->foveatedCutoutRadius = foveatedCutoutRadius;
         g_dlssConfig->foveatedWiden = foveatedWiden;
 
-        // Early DLSS flags
+        // Early DLSS flags (forced off for now)
         g_dlssConfig->earlyDlssEnabled = earlyDlssEnabledSetting;
         g_dlssConfig->earlyDlssMode = earlyDlssModeSetting;
         g_dlssConfig->debugEarlyDlss = debugEarlyDlssSetting;
+        g_dlssConfig->streamlineOnly = streamlineOnlySetting;
+        g_dlssConfig->ForceDisableEarlyDlss("UI sync");
+        earlyDlssEnabledSetting = g_dlssConfig->earlyDlssEnabled;
+        earlyDlssModeSetting = g_dlssConfig->earlyDlssMode;
 
         if (persist) {
             g_dlssConfig->Save();
+        }
+    }
+
+    void ApplyBackendSettings() {
+        if (g_dlssConfig) {
+            g_dlssConfig->streamlineOnly = streamlineOnlySetting;
+            g_dlssConfig->Save();
+        }
+        // Recreate DLSS runtime with new backend policy
+        if (g_dlssManager) {
+            g_dlssManager->Shutdown();
         }
     }
 };
