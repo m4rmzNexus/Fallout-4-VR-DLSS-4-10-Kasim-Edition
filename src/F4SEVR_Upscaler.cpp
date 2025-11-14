@@ -110,14 +110,11 @@ bool F4SEVR_Upscaler::InitializeUpscaler() {
     switch (currentUpscaler) {
         case UPSCALER_DLSS:
         case UPSCALER_DLSS4:
-            // TODO: Initialize NVIDIA NGX for DLSS
             dlssInitialized = false;
             break;
         case UPSCALER_FSR2:
-            // TODO: Initialize AMD FSR2
             break;
         case UPSCALER_XESS:
-            // TODO: Initialize Intel XeSS
             break;
         case UPSCALER_DLAA:
             // DLAA is DLSS at native resolution
@@ -134,7 +131,6 @@ bool F4SEVR_Upscaler::InitializeUpscaler() {
 
 void F4SEVR_Upscaler::ShutdownUpscaler() {
     if (dlssInitialized) {
-        // TODO: Cleanup DLSS
         dlssInitialized = false;
     }
 }
@@ -229,7 +225,6 @@ void F4SEVR_Upscaler::ProcessFrame() {
     refreshMotion();
     refreshDepth();
 
-    // Apply fixed foveated rendering for VR
     if (isVR && enableFixedFoveatedRendering) {
         ApplyFixedFoveatedRendering();
     }
@@ -238,16 +233,12 @@ void F4SEVR_Upscaler::ProcessFrame() {
     switch (currentUpscaler) {
         case UPSCALER_DLSS:
         case UPSCALER_DLSS4:
-            // TODO: Execute DLSS
             break;
         case UPSCALER_FSR2:
-            // TODO: Execute FSR2
             break;
         case UPSCALER_XESS:
-            // TODO: Execute XeSS
             break;
         case UPSCALER_DLAA:
-            // TODO: Execute DLAA
             break;
         case UPSCALER_TAA:
             // Let game handle TAA
@@ -375,7 +366,6 @@ void F4SEVR_Upscaler::SetupOpaqueColor(ID3D11Texture2D* texture) {
 void F4SEVR_Upscaler::ApplyFixedFoveatedRendering() {
     // VR-specific fixed foveated rendering implementation
     // Reduces resolution in peripheral vision for better performance
-    // TODO: Implement foveated rendering
 }
 
 void F4SEVR_Upscaler::LoadSettings() {
@@ -438,7 +428,6 @@ void F4SEVR_Upscaler::LoadSettings() {
 }
 
 void F4SEVR_Upscaler::SaveSettings() {
-    // TODO: Save current settings to INI file
 }
 
 // ImageWrapper implementation

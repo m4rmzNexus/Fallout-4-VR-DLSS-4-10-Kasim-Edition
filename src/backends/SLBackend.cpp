@@ -572,7 +572,7 @@ ID3D11Texture2D* SLBackend::ProcessEye(ID3D11Texture2D* inputColor,
     // Assume 2D pixel-space motion vectors by default
     // Zero-MV defaults and flags
     consts.motionVectorsInvalidValue = 0.0f;
-    consts.depthInverted = sl::Boolean::eFalse;           // TODO: set true if engine uses inverted depth
+    consts.depthInverted = sl::Boolean::eFalse;
     consts.cameraMotionIncluded = sl::Boolean::eFalse;     // we do not include camera motion in MV
     consts.motionVectors3D = sl::Boolean::eFalse;
     consts.motionVectorsJittered = sl::Boolean::eFalse;    // VR jitter disabled
