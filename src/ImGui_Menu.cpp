@@ -240,24 +240,19 @@ public:
             }
 
             if (ImGui::CollapsingHeader("Early DLSS (Experimental)", 0)) {
-                ImGui::TextWrapped("Render-time DLSS integration to reduce shading resolution.\n"
-                                   "Faz 1 (Viewport clamp) and Faz 2 (RT redirect) are guarded by flags.");
-                if (ImGui::Checkbox("Enable Early DLSS", &earlyDlssEnabledSetting)) {
-                    // Persist immediately so next launch picks it up from Documents INI
-                    WriteSettingsToConfig(true);
-                }
+                ImGui::TextWrapped("Early DLSS bu derlemede kalici olarak devre disi birakildi.\n"
+                                   "Render-time entegrasyona ait tum kontroller salt okunur durumdadir.");
+                ImGui::BeginDisabled(true);
+                ImGui::Checkbox("Enable Early DLSS", &earlyDlssEnabledSetting);
                 const char* earlyModes[] = { "Viewport clamp", "RT redirect" };
-                if (ImGui::Combo("Mode", &earlyDlssModeSetting, earlyModes, IM_ARRAYSIZE(earlyModes))) {
-                    WriteSettingsToConfig(true);
-                }
-                if (ImGui::Checkbox("Debug logs (low rate)", &debugEarlyDlssSetting)) {
-                    WriteSettingsToConfig(true);
-                }
+                ImGui::Combo("Mode", &earlyDlssModeSetting, earlyModes, IM_ARRAYSIZE(earlyModes));
+                ImGui::Checkbox("Debug logs (low rate)", &debugEarlyDlssSetting);
+                ImGui::Separator();
+                ImGui::TextDisabled("Note: Phase 0 instrumentation only (no behavior change).");
+                ImGui::EndDisabled();
                 if (ImGui::Checkbox("Backend: Streamline only (disable NGX fallback)", &streamlineOnlySetting)) {
                     ApplyBackendSettings();
                 }
-                ImGui::Separator();
-                ImGui::TextDisabled("Note: Phase 0 instrumentation only (no behavior change).");
             }
 
             if (ImGui::CollapsingHeader("Advanced Rendering", showAdvancedSettings ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {

@@ -25,8 +25,11 @@ extern DLSSManager* g_dlssManager;
 extern DLSSConfig* g_dlssConfig;
 
 namespace {
+    // Compile-time guard to keep Early DLSS disabled in this build.
+    constexpr bool kEarlyDlssFeatureEnabled = false;
+
     inline bool DlssTraceEnabled() {
-        return g_dlssConfig && g_dlssConfig->debugEarlyDlss;
+        return kEarlyDlssFeatureEnabled && g_dlssConfig && g_dlssConfig->debugEarlyDlss;
     }
 
     inline bool DlssTraceSampled(uint32_t modulo) {
@@ -38,7 +41,7 @@ namespace {
     }
 
     inline bool IsEarlyDlssActive() {
-        return g_dlssConfig && g_dlssConfig->earlyDlssEnabled;
+        return kEarlyDlssFeatureEnabled && g_dlssConfig && g_dlssConfig->earlyDlssEnabled;
     }
 }
 
@@ -790,14 +793,14 @@ namespace {
                             // side-by-side
                             recW = fullW / 2u;
                             recH = fullH;
-                            if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
+                            if (DlssTraceEnabled()) {
                                 _MESSAGE("[EarlyDLSS][SIZE] SxS atlas detected: per-eye=%ux%u from full=%ux%u", recW, recH, fullW, fullH);
                             }
                         } else if (fullH >= (uint32_t)((double)fullW * 1.7)) {
                             // top-bottom
                             recW = fullW;
                             recH = fullH / 2u;
-                            if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
+                            if (DlssTraceEnabled()) {
                                 _MESSAGE("[EarlyDLSS][SIZE] T/B atlas detected: per-eye=%ux%u from full=%ux%u", recW, recH, fullW, fullH);
                             }
                         }
@@ -817,7 +820,7 @@ namespace {
                     // even-align after scale
                     newW &= ~1u; newH &= ~1u;
                     if (newW == 0) newW = 2; if (newH == 0) newH = 2;
-                    if (g_dlssConfig->debugEarlyDlss) {
+                    if (DlssTraceEnabled()) {
                         _MESSAGE("[EarlyDLSS][SIZE] Cap applied: %ux%u -> %ux%u (cap=%u)", recW, recH, newW, newH, cap);
                     }
                     recW = newW; recH = newH;
@@ -833,7 +836,7 @@ namespace {
             // based on current DLSS quality and per-eye output, without changing behavior.
             static uint64_t s_dbgCounter = 0;
             ++s_dbgCounter;
-            if (earlyActive && g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
+            if (earlyActive && DlssTraceEnabled()) {
                 // Log at a low rate to avoid spam
                 if ((s_dbgCounter % 300) == 1) {
                     uint32_t prW = 0, prH = 0;
@@ -927,12 +930,12 @@ namespace {
                             DLSS_TRACE_SAMPLED(120,
                                                "Submit eye=%d copy dst=(%u,%u %ux%u) src=(%ux%u)",
                                                (int)eye, dstX, dstY, copyW, copyH, srcDesc.Width, srcDesc.Height);
-                            if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
+                            if (DlssTraceEnabled()) {
                                 _MESSAGE("[Submit] Copy DLSS eye=%s dst=(%u,%u %ux%u) src=(%ux%u)",
                                          eye==vr::Eye_Left?"L":"R", dstX, dstY, copyW, copyH, srcDesc.Width, srcDesc.Height);
                             }
                         }
-                    } else if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
+                    } else if (DlssTraceEnabled()) {
                         _MESSAGE("[Submit] Skip copy: fmt/msaa mismatch srcFmt=%u dstFmt=%u srcS=%u dstS=%u",
                                  (unsigned)srcDesc.Format, (unsigned)dstDesc.Format,
                                  (unsigned)srcDesc.SampleDesc.Count, (unsigned)dstDesc.SampleDesc.Count);
@@ -1046,7 +1049,7 @@ namespace {
                                                "SubmitIdx eye=%d copy dst=(%u,%u %ux%u sub=%u) src=(%ux%u)",
                                                (int)eye, dstX, dstY, copyW, copyH, dstSub, srcDesc.Width, srcDesc.Height);
                         }
-                    } else if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
+                    } else if (DlssTraceEnabled()) {
                         _MESSAGE("[SubmitIdx] Skip copy: fmt/msaa mismatch srcFmt=%u dstFmt=%u srcS=%u dstS=%u",
                                  (unsigned)srcDesc.Format, (unsigned)dstDesc.Format,
                                  (unsigned)srcDesc.SampleDesc.Count, (unsigned)dstDesc.SampleDesc.Count);
@@ -1328,7 +1331,7 @@ namespace DLSSHooks {
         if (desc) {
             local = *desc;
             // Only when enabled
-            if (g_dlssConfig && g_dlssConfig->earlyDlssEnabled && g_vrSubmitHookInstalled) {
+            if (IsEarlyDlssActive() && g_vrSubmitHookInstalled) {
                 // Avoid touching depth/typeless DS, shared, non-RT
                 const bool isColorRT = (local.BindFlags & D3D11_BIND_RENDER_TARGET) && (local.BindFlags & D3D11_BIND_SHADER_RESOURCE) && ((local.BindFlags & D3D11_BIND_DEPTH_STENCIL) == 0);
                 if (isColorRT && IsLikelyVRSceneRT(local)) {
@@ -1350,7 +1353,7 @@ namespace DLSSHooks {
                                 local.Height = prH;
                                 useDesc = &local;
                                 modified = true;
-                                if (g_dlssConfig->debugEarlyDlss) {
+                                if (DlssTraceEnabled()) {
                                     _MESSAGE("[CreateTex2D][Scale] %ux%u -> %ux%u fmt=%u", desc->Width, desc->Height, local.Width, local.Height, (unsigned)local.Format);
                                 }
                             }
@@ -1770,7 +1773,7 @@ namespace DLSSHooks {
                 if (IsLikelyVRSceneRT(d)) {
                     g_sceneRTDesc = d;
                     g_sceneActive.store(true, std::memory_order_relaxed);
-                    if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
+                    if (DlssTraceEnabled()) {
                         _MESSAGE("[EarlyDLSS][SceneBegin] RTV=%ux%u fmt=%u", d.Width, d.Height, (unsigned)d.Format);
                     }
                 } else {
@@ -1779,7 +1782,7 @@ namespace DLSSHooks {
                     if (GetSwapChainSize(sw, sh) && d.Width==sw && d.Height==sh) {
                         if (g_sceneActive.load(std::memory_order_relaxed)) {
                             g_sceneActive.store(false, std::memory_order_relaxed);
-                            if (g_dlssConfig && g_dlssConfig->debugEarlyDlss && g_clampLogBudgetPerFrame > 0) {
+                            if (DlssTraceEnabled() && g_clampLogBudgetPerFrame > 0) {
                                 _MESSAGE("[EarlyDLSS][SceneEnd] Mirror backbuffer bound %ux%u - clamp disabled", d.Width, d.Height);
                                 --g_clampLogBudgetPerFrame;
                             }
@@ -1835,7 +1838,7 @@ namespace DLSSHooks {
                             std::vector<ID3D11RenderTargetView*> rtvs(numRTVs);
                             for (UINT i=0;i<numRTVs;++i) rtvs[i] = ppRTVs[i];
                             rtvs[0] = smallRTV;
-                            if (g_dlssConfig->debugEarlyDlss) {
+                            if (DlssTraceEnabled()) {
                                 _MESSAGE("[EarlyDLSS][Redirect] RTV old=%ux%u -> small=%ux%u", g_sceneRTDesc.Width, g_sceneRTDesc.Height, prW, prH);
                             }
                             if (RealOMSetRenderTargets) RealOMSetRenderTargets(ctx, numRTVs, rtvs.data(), pDSV);
@@ -1884,13 +1887,13 @@ namespace DLSSHooks {
 
     void STDMETHODCALLTYPE HookedRSSetViewports(ID3D11DeviceContext* ctx, UINT count, const D3D11_VIEWPORT* viewports) {
         // Clamp viewports when Early DLSS is enabled (both clamp and redirect modes)
-        if (!g_dlssConfig || !g_dlssConfig->earlyDlssEnabled || !viewports || count == 0) {
+        if (!IsEarlyDlssActive() || !viewports || count == 0) {
             if (RealRSSetViewports) RealRSSetViewports(ctx, count, viewports);
             return;
         }
         // Only clamp inside a detected scene
         if (!g_sceneActive.load(std::memory_order_relaxed)) {
-            if (g_dlssConfig->debugEarlyDlss && g_clampLogBudgetPerFrame > 0) {
+            if (DlssTraceEnabled() && g_clampLogBudgetPerFrame > 0) {
                 _MESSAGE("[EarlyDLSS][CLAMP] skip: no scene active");
                 --g_clampLogBudgetPerFrame;
             }
@@ -1911,7 +1914,7 @@ namespace DLSSHooks {
         // Compute predicted render size
         uint32_t prW=0, prH=0;
         if (!g_dlssManager || !g_dlssManager->ComputeRenderSizeForOutput(tgtOutW, tgtOutH, prW, prH)) {
-            if (g_dlssConfig->debugEarlyDlss && g_clampLogBudgetPerFrame > 0) {
+            if (DlssTraceEnabled() && g_clampLogBudgetPerFrame > 0) {
                 _MESSAGE("[EarlyDLSS][CLAMP] skip: no optimal size for %ux%u", tgtOutW, tgtOutH);
                 --g_clampLogBudgetPerFrame;
             }
@@ -1919,7 +1922,7 @@ namespace DLSSHooks {
             return;
         }
         if (prW == 0 || prH == 0) {
-            if (g_dlssConfig->debugEarlyDlss && g_clampLogBudgetPerFrame > 0) {
+            if (DlssTraceEnabled() && g_clampLogBudgetPerFrame > 0) {
                 _MESSAGE("[EarlyDLSS][CLAMP] skip: predicted size is zero");
                 --g_clampLogBudgetPerFrame;
             }
@@ -1940,14 +1943,14 @@ namespace DLSSHooks {
             if (approxEq(vp.Width, (float)tgtOutW) && approxEq(vp.Height, (float)tgtOutH)) {
                 anyMatched = true;
                 if (!approxEq(vp.Width, (float)prW) || !approxEq(vp.Height, (float)prH)) {
-                    if (g_dlssConfig->debugEarlyDlss && g_clampLogBudgetPerFrame > 0) {
+                    if (DlssTraceEnabled() && g_clampLogBudgetPerFrame > 0) {
                         _MESSAGE("[EarlyDLSS][CLAMP] vp old=(%.0fx%.0f) -> new=(%ux%u)", vp.Width, vp.Height, prW, prH);
                         --g_clampLogBudgetPerFrame;
                     }
                     vp.Width  = (float)prW;
                     vp.Height = (float)prH;
                     anyClamped = true;
-                } else if (g_dlssConfig->debugEarlyDlss && g_clampLogBudgetPerFrame > 0) {
+                } else if (DlssTraceEnabled() && g_clampLogBudgetPerFrame > 0) {
                     _MESSAGE("[EarlyDLSS][CLAMP] skip: already at predicted size (%ux%u)", prW, prH);
                     --g_clampLogBudgetPerFrame;
                 }
@@ -1956,7 +1959,7 @@ namespace DLSSHooks {
         if (RealRSSetViewports) {
             RealRSSetViewports(ctx, count, vps.data());
         }
-        if (!anyClamped && !anyMatched && g_dlssConfig->debugEarlyDlss && g_clampLogBudgetPerFrame > 0) {
+        if (!anyClamped && !anyMatched && DlssTraceEnabled() && g_clampLogBudgetPerFrame > 0) {
             _MESSAGE("[EarlyDLSS][CLAMP] skip: no matching viewport for target %ux%u", tgtOutW, tgtOutH);
             --g_clampLogBudgetPerFrame;
         }
@@ -2001,7 +2004,7 @@ static ID3D11RenderTargetView* GetOrCreateSmallRTVFor(ID3D11RenderTargetView* bi
             return nullptr;
         }
         e.smallW = prW; e.smallH = prH; e.format = d.Format;
-        if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
+        if (DlssTraceEnabled()) {
             _MESSAGE("[EarlyDLSS][RT] Created small RT %ux%u for fmt=%u", prW, prH, (unsigned)d.Format);
         }
     }
@@ -2011,7 +2014,7 @@ static ID3D11RenderTargetView* GetOrCreateSmallRTVFor(ID3D11RenderTargetView* bi
 
     // If a big scene RT gets rebound after redirect, composite small->big once
     static void CompositeIfNeededOnBigBind(ID3D11RenderTargetView* bigRTV) {
-        if (!g_dlssConfig || !g_dlssConfig->earlyDlssEnabled) return;
+        if (!IsEarlyDlssActive()) return;
         if (!g_redirectUsedThisFrame.load(std::memory_order_relaxed) || g_compositedThisFrame) return;
         if (g_inComposite.load(std::memory_order_relaxed)) return; // avoid recursion
         if (!bigRTV) return;
@@ -2059,10 +2062,10 @@ static ID3D11RenderTargetView* GetOrCreateSmallRTVFor(ID3D11RenderTargetView* bi
             }
             if (ok) {
                 g_compositedThisFrame = true;
-                if (g_dlssConfig->debugEarlyDlss) {
+                if (DlssTraceEnabled()) {
                     _MESSAGE("[EarlyDLSS][Composite] DLSS engine-copy to %ux%u (per-eye out %ux%u)", g_sceneRTDesc.Width, g_sceneRTDesc.Height, outW, outH);
                 }
-            } else if (g_dlssConfig && g_dlssConfig->debugEarlyDlss) {
+            } else if (DlssTraceEnabled()) {
                 _MESSAGE("[EarlyDLSS][Composite] DLSS engine-copy skipped (no sizes or outputs)");
             }
             g_inComposite.store(false, std::memory_order_relaxed);
